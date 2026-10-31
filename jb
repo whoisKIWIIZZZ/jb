@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+"""jb - 轻量后台任务管理 (仅依赖标准库).
+
+  jb submit [-n NAME] [-g 0,1|cpu] [--total N] [--after ID] -- CMD ...   提交后台任务
+  jb ls [-a] [-v]          列出任务 (状态 / 进度 / ETA)
+  jb show ID               任务详情 + 日志尾部
+  jb log ID [-n 40] [-f]   查看日志
+  jb wait ID ...           阻塞直到任务结束
+  jb kill ID ...           终止任务
+  jb retry ID              用相同参数重新提交
+  jb gpu                   GPU 占用 + 对应任务
+  jb notify set serverchan KEY   任务结束推送到微信 (还支持 pushplus/qmsg/bark/ntfy/webhook)
+  jb serve -d              后台启动网页 dashboard (默认 127.0.0.1:18765)
+  jb rm ID ... / jb clean  删除任务记录
+
+进度识别 (优先级从高到低):
+  1. 脚本打印 "[jb] progress 123/1000"
+  2. submit 时给 --total N (+ 可选 --pattern, 默认匹配 "step 123")
+  3. 日志中的 "step 12/100" "epoch 3/10" 之类
+  4. tqdm 进度条
+"""
+import argparse
+import fcntl
+import hmac
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.error
+import urllib.request
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser(os.environ.get("JB_HOME", "~/.jb"))
+JOBS = os.path.join(HOME, "jobs")
+DEFAULT_CFG = {"default_gpus": None, "allowed_gpus": None}  # None = 不限制, 在 ~/.jb/config.json 里覆盖
+ACTIVE = ("queued", "running")
+
+
+# ---------------------------------------------------------------- storage
+
+def load_cfg():
+    c = dict(DEFAULT_CFG)
+    c.update(read_json(os.path.join(HOME, "config.json"), {}))
+    return c
+
+
+def jdir(jid):
+    return os.path.join(JOBS, str(jid))
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def all_ids():
+    if not os.path.isdir(JOBS):
+        return []
+    return sorted(int(x) for x in os.listdir(JOBS) if x.isdigit())
+
+
+def new_id():
+    os.makedirs(JOBS, exist_ok=True)
+    with open(os.path.join(HOME, "lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        counter = os.path.join(HOME, "next_id")
+        try:
+            jid = int(open(counter).read().strip())
+        except (FileNotFoundError, ValueError):
+            jid = 1
+        ids = all_ids()
+        jid = max(jid, ids[-1] + 1 if ids else 1)
+        os.makedirs(jdir(jid))
+        with open(counter, "w") as f:
+            f.write(str(jid + 1))
+    return jid
+
+
+def meta(jid):
+    m = read_json(os.path.join(jdir(jid), "meta.json"))
+    if m is None:
+        sys.exit(f"jb: 没有任务 {jid}")
+    return m
+
+
+def progress(jid):
+    return read_json(os.path.join(jdir(jid), "progress.json"), {})
+
+
+def pid_alive(pid, must_contain=None):
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                return False
+        if must_contain:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return must_contain in f.read().decode(errors="replace").split("\0")
+        return True
+    except (FileNotFoundError, IndexError, ProcessLookupError):
+        return False
+
+
+def status(m):
+    if "end" in m:
+        if m.get("killed"):
+            return "killed"
+        if m.get("rc") is None:
+            return "cancelled"
+        return "done" if m["rc"] == 0 else "failed"
+    if pid_alive(m.get("runner_pid"), str(m["id"])):
+        return "running" if "start" in m else "queued"
+    return "lost"
+
+
+# ---------------------------------------------------------------- formatting
+
+def fmt_dur(s):
+    if s is None:
+        return "-"
+    s = int(max(0, s))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d{h:02}h{m:02}m"
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def fmt_time(t):
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(t)) if t else "-"
+
+
+def fmt_num(x):
+    return str(int(x)) if float(x).is_integer() else f"{x:.4g}"
+
+
+COLORS = {"running": "32", "queued": "36", "done": "34", "failed": "31",
+          "killed": "33", "cancelled": "33", "lost": "35"}
+
+
+def color(st, text=None):
+    text = st if text is None else text
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{COLORS.get(st, '0')}m{text}\033[0m"
+
+
+def elapsed(m):
+    if "start" not in m:
+        return None
+    return m.get("end", time.time()) - m["start"]
+
+
+def eta_now(m, st, p):
+    if st != "running" or p.get("eta") is None:
+        return None
+    return max(0.0, p["eta"] - (time.time() - p["updated"]))
+
+
+def prog_str(p):
+    if not p.get("total"):
+        return fmt_num(p["done"]) if p.get("done") is not None else "-"
+    return f"{fmt_num(p['done'])}/{fmt_num(p['total'])} {100 * p['done'] / p['total']:.0f}%"
+
+
+def render_cr(text):
+    """把 tqdm 的 \\r 刷新折叠成每行最终状态."""
+    out = []
+    for line in text.split("\n"):
+        segs = [s for s in line.split("\r") if s.strip()]
+        out.append(segs[-1] if segs else line.replace("\r", ""))
+    return out
+
+
+def tail_lines(path, n, max_bytes=4 << 20):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            data = f.read().decode(errors="replace")
+    except FileNotFoundError:
+        return []
+    lines = render_cr(data)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines[-n:] if n else lines
+
+
+# ---------------------------------------------------------------- progress parsing
+
+RE_EXPLICIT = re.compile(r"\[jb\]\s*progress\s*[:=]?\s*([\d.]+)\s*/\s*([\d.]+)", re.I)
+RE_KEYWORD = re.compile(
+    r"\b(?:global[_ ]?)?(?:step|epoch|iter|iteration|ep|batch|episode|round|trial|chunk)s?\b"
+    r"\s*[:=#]?\s*(\d+)\s*/\s*(\d+)", re.I)
+RE_TQDM = re.compile(r"(\d+)%\|[^|]*\|\s*([\d.]+[kMG]?)/([\d.]+[kMG]?)\s*\[([\d:]+)<([\d:?]+)")
+DEFAULT_PATTERN = r"(?i)\bstep\b\s*[:=#]?\s*(\d+)"
+
+
+def scaled(s):
+    mult = {"k": 1e3, "M": 1e6, "G": 1e9}.get(s[-1])
+    return float(s[:-1]) * mult if mult else float(s)
+
+
+def hms(s):
+    if "?" in s:
+        return None
+    sec = 0
+    for part in s.split(":"):
+        sec = sec * 60 + int(part)
+    return sec
+
+
+class Tracker:
+    """在 runner 进程里增量读取日志, 解析进度, 估计速率与 ETA."""
+
+    def __init__(self, jid, m):
+        self.path_out = os.path.join(jdir(jid), "progress.json")
+        self.log = m["log"]
+        self.offset = 0
+        self.carry = ""
+        self.level = -1
+        self.done = self.total = self.tqdm_eta = None
+        self.source = None
+        self.last_line = ""
+        self.samples = deque(maxlen=2000)
+        self.user_total = m.get("total")
+        self.user_pat = re.compile(m.get("pattern") or DEFAULT_PATTERN) if self.user_total or m.get("pattern") else None
+
+    def _accept(self, level, done, total, source, eta=None):
+        if level < self.level:
+            return
+        self.level, self.done, self.total, self.source, self.tqdm_eta = level, done, total, source, eta
+
+    def _parse(self, seg):
+        if (mt := RE_EXPLICIT.search(seg)):
+            self._accept(3, float(mt[1]), float(mt[2]), "jb")
+            return
+        if self.user_pat and (mt := self.user_pat.search(seg)):
+            total = float(mt[2]) if mt.re.groups >= 2 and mt[2] else self.user_total
+            self._accept(2, float(mt[1]), float(total) if total else None, "pattern")
+            return
+        if (mt := RE_KEYWORD.search(seg)):
+            self._accept(1, float(mt[1]), float(mt[2]), "keyword")
+            return
+        if (mt := RE_TQDM.search(seg)):
+            self._accept(0, scaled(mt[2]), scaled(mt[3]), "tqdm", hms(mt[5]))
+
+    def update(self):
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except FileNotFoundError:
+            return
+        if not data:
+            self._write()
+            return
+        self.offset += len(data)
+        text = self.carry + data.decode(errors="replace")
+        segs = re.split(r"[\r\n]", text)
+        self.carry = segs[-1][-65536:]
+        prev = self.done
+        for seg in segs:
+            if seg.strip():
+                self._parse(seg)
+                self.last_line = seg.strip()[:300]
+        if self.done is not None and self.done != prev:
+            if self.samples and self.done < self.samples[-1][1]:
+                self.samples.clear()
+            self.samples.append((time.time(), self.done))
+        self._write()
+
+    def _write(self):
+        now = time.time()
+        rate = eta = None
+        if len(self.samples) >= 2:
+            t1, d1 = self.samples[-1]
+            t0, d0 = next(((t, d) for t, d in self.samples if t >= t1 - 900), self.samples[0])
+            if (t0, d0) == (t1, d1):
+                t0, d0 = self.samples[-2]
+            if t1 > t0 and d1 > d0:
+                rate = (d1 - d0) / (t1 - t0)
+        if self.source == "tqdm" and self.tqdm_eta is not None:
+            eta = self.tqdm_eta
+        elif rate and self.total:
+            eta = max(0.0, (self.total - self.done) / rate)
+        write_json(self.path_out, {
+            "done": self.done, "total": self.total, "source": self.source, "rate": rate,
+            "eta": eta, "updated": now, "last_line": self.last_line,
+        })
+
+
+# ---------------------------------------------------------------- notify
+
+ST_CN = {"done": "完成", "failed": "失败", "killed": "已终止", "cancelled": "已取消", "lost": "丢失"}
+NOTIFY_KEYS = {
+    "serverchan": "Server酱 SendKey (微信), 见 sct.ftqq.com",
+    "pushplus": "PushPlus token (微信), 见 pushplus.plus",
+    "qmsg": "Qmsg酱 key (QQ), 见 qmsg.zendee.cn",
+    "qmsg_group": "Qmsg 推送到的 QQ 群号 (可选, 默认推到绑定机器人的单聊)",
+    "bark": "Bark URL, 如 https://api.day.app/KEY (iPhone)",
+    "ntfy": "ntfy URL, 如 https://ntfy.sh/<topic>",
+    "webhook": "任意 URL, POST JSON {title,text,job}",
+    "min_seconds": "运行少于这么多秒的任务不推送 (默认 60)",
+    "on": "推送哪些状态, 逗号分隔 (默认 done,failed,killed)",
+}
+
+
+def _post(url, form=None, js=None, timeout=10):
+    if js is not None:
+        body, ctype = json.dumps(js, ensure_ascii=False).encode(), "application/json; charset=utf-8"
+    else:
+        body, ctype = urllib.parse.urlencode(form or {}).encode(), "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype, "User-Agent": "jb"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(300).decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        body = e.read(300).decode(errors="replace")
+        if body.lstrip().startswith("<"):
+            body = "(HTML 页面, 多半是对方网站防火墙拦截)"
+        raise RuntimeError(f"HTTP {e.code}: {body}") from None
+
+
+def send_notify(ncfg, title, text, job=None):
+    """按配置的渠道逐个发送, 返回 [(渠道, 结果或错误)]."""
+    reqs = []  # (渠道, url, form, json); 全部当场求值, 避免闭包晚绑定
+    short = "\n".join([title] + text.split("\n")[:3])
+    if k := ncfg.get("serverchan"):
+        mt = re.match(r"sctp(\d+)t", k)
+        url = f"https://{mt[1]}.push.ft07.com/send/{k}.send" if mt else f"https://sctapi.ftqq.com/{k}.send"
+        reqs.append(("serverchan", url, {"title": title[:32], "desp": f"```\n{text}\n```"}, None))
+    if k := ncfg.get("pushplus"):
+        reqs.append(("pushplus", "https://www.pushplus.plus/send", None,
+                     {"token": k, "title": title, "content": text, "template": "txt"}))
+    if k := ncfg.get("qmsg"):
+        form = {"msg": f"{title}\n{text}"[:1800]}
+        if ncfg.get("qmsg_group"):
+            form["group"] = ncfg["qmsg_group"]
+        reqs.append(("qmsg", f"https://qmsg.zendee.cn/v3/send/{k}", form, None))
+        # Qmsg 的网站防火墙会拦截含 shell 片段 (引号/分号/重定向) 的消息, 被拦时退回只含状态的短消息
+        reqs.append(("qmsg-short", f"https://qmsg.zendee.cn/v3/send/{k}", dict(form, msg=short), None))
+    if k := ncfg.get("bark"):
+        reqs.append(("bark", k.rstrip("/"), None, {"title": title, "body": text, "group": "jb"}))
+    if k := ncfg.get("ntfy"):
+        base, topic = k.rstrip("/").rsplit("/", 1)
+        reqs.append(("ntfy", base, None, {"topic": topic, "title": title, "message": text, "tags": ["jb"]}))
+    if k := ncfg.get("webhook"):
+        reqs.append(("webhook", k, None, {"title": title, "text": text, "job": job}))
+    results = []
+    for name, url, form, js in reqs:
+        if name == "qmsg-short" and not results[-1][1].startswith("ERROR HTTP 403"):
+            continue
+        if name == "qmsg-short":
+            time.sleep(3.5)  # Qmsg 同一 key 3 秒限流
+        for attempt in range(2):
+            try:
+                res = _post(url, form, js)
+            except Exception as e:
+                res = f"ERROR {e}"
+            if not (name.startswith("qmsg") and "频率" in res):
+                break
+            time.sleep(3.5)  # 两个任务几乎同时结束时会撞上限流, 等一下重试
+        results.append((name, res))
+    return results
+
+
+def job_message(m):
+    st = status(m)
+    p = progress(m["id"])
+    title = f"[jb] #{m['id']} {m.get('name')} {ST_CN.get(st, st)}"
+    lines = [f"状态: {st}" + (f" (rc={m['rc']})" if m.get("rc") not in (None, 0) else ""),
+             f"用时: {fmt_dur(elapsed(m))}", f"主机: {socket.gethostname()}"]
+    if p.get("done") is not None:
+        lines.append(f"进度: {prog_str(p)}")
+    if m.get("note"):
+        lines.append(f"备注: {m['note']}")
+    lines.append(f"命令: {m['cmd'][:200]}")
+    if st != "done":
+        lines += ["", "日志末尾:"] + [l[:200] for l in tail_lines(m["log"], 8)]
+    elif p.get("last_line"):
+        lines.append(f"最后输出: {p['last_line'][:200]}")
+    return title, "\n".join(lines)
+
+
+def maybe_notify(jid):
+    ncfg = load_cfg().get("notify") or {}
+    m = read_json(os.path.join(jdir(jid), "meta.json"))
+    if not m or m.get("notify") is False or not any(ncfg.get(k) for k in ("serverchan", "pushplus", "qmsg", "bark", "ntfy", "webhook")):
+        return
+    st = status(m)
+    on = ncfg.get("on", "done,failed,killed")
+    on = on.split(",") if isinstance(on, str) else on
+    if st not in on:
+        return
+    if m.get("notify") is not True and (elapsed(m) or 0) < float(ncfg.get("min_seconds", 60)):
+        return
+    title, text = job_message(m)
+    for name, res in send_notify(ncfg, title, text, job={"id": jid, "name": m.get("name"), "status": st, "rc": m.get("rc")}):
+        print(f"notify {name}: {res}", flush=True)
+
+
+def cmd_notify(a):
+    path = os.path.join(HOME, "config.json")
+    c = read_json(path, {})
+    ncfg = c.setdefault("notify", {})
+    if a.action == "set":
+        if not a.key or a.value is None:
+            sys.exit("用法: jb notify set KEY VALUE   可用 KEY:\n" + "\n".join(f"  {k:12} {v}" for k, v in NOTIFY_KEYS.items()))
+        if a.key not in NOTIFY_KEYS:
+            sys.exit(f"jb: 未知 KEY {a.key}, 可用: {', '.join(NOTIFY_KEYS)}")
+        if a.value == "":
+            ncfg.pop(a.key, None)
+        else:
+            ncfg[a.key] = a.value
+        os.makedirs(HOME, exist_ok=True)
+        write_json(path, c)
+        os.chmod(path, 0o600)
+        print(f"已设置 notify.{a.key}")
+    elif a.action == "show":
+        if not ncfg:
+            print("未配置推送渠道. jb notify set serverchan <SendKey> 等, 运行 jb notify set 查看可用 KEY")
+        for k, v in ncfg.items():
+            s = str(v)
+            print(f"  {k:12} {s if k in ('min_seconds', 'on', 'qmsg_group') else s[:6] + '…' + s[-3:] if len(s) > 12 else '***'}")
+    elif a.action == "test":
+        res = send_notify(ncfg, "[jb] 测试推送", f"来自 {socket.gethostname()} 的测试消息\n{time.strftime('%F %T')}")
+        if not res:
+            print("未配置推送渠道")
+        for name, r in res:
+            print(f"{name}: {r}")
+
+
+# ---------------------------------------------------------------- runner (detached)
+
+def run_job(jid):
+    d = jdir(jid)
+    mpath = os.path.join(d, "meta.json")
+    killed_flag = os.path.join(d, "killed")
+
+    def finish(rc, **extra):
+        m = read_json(mpath)
+        m.update(end=time.time(), rc=rc, killed=os.path.exists(killed_flag), **extra)
+        write_json(mpath, m)
+
+    m = read_json(mpath)
+    m["runner_pid"] = os.getpid()
+    write_json(mpath, m)
+    for dep in m.get("after", []):
+        while True:
+            if os.path.exists(killed_flag):
+                return finish(None)
+            dm = read_json(os.path.join(jdir(dep), "meta.json"))
+            st = status(dm) if dm else "missing"
+            if st not in ACTIVE:
+                break
+            time.sleep(3)
+        if st != "done" and not m.get("after_any"):
+            return finish(None, reason=f"依赖任务 {dep} 状态为 {st}")
+
+    env = os.environ.copy()
+    env.update(m.get("env", {}))
+    env["PYTHONUNBUFFERED"] = "1"
+    env["JB_JOB_ID"] = str(jid)
+    os.makedirs(os.path.dirname(m["log"]) or ".", exist_ok=True)
+    with open(m["log"], "ab") as log:
+        p = subprocess.Popen(["bash", "-c", m["cmd"]], cwd=m["cwd"], env=env, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    m = read_json(mpath)
+    m.update(start=time.time(), child_pid=p.pid)
+    write_json(mpath, m)
+
+    tracker = Tracker(jid, m)
+    tick = 0
+    while p.poll() is None:
+        if tick % 5 == 0:
+            tracker.update()
+        tick += 1
+        time.sleep(1)
+    tracker.update()
+    finish(p.returncode)
+    maybe_notify(jid)
+
+
+# ---------------------------------------------------------------- commands
+
+def guess_name(cmd):
+    toks = shlex.split(cmd) if cmd else []
+    if "-m" in toks and toks.index("-m") + 1 < len(toks):
+        return toks[toks.index("-m") + 1].rsplit(".", 1)[-1]
+    for t in toks:
+        if t.endswith((".py", ".sh")):
+            return os.path.splitext(os.path.basename(t))[0]
+    return os.path.basename(toks[0]) if toks else "job"
+
+
+def git_rev(cwd):
+    try:
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd, capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        if not rev:
+            return None
+        dirty = subprocess.run(["git", "status", "--porcelain", "-uno"], cwd=cwd, capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        return rev + ("+dirty" if dirty else "")
+    except Exception:
+        return None
+
+
+def parse_gpus(spec, force):
+    """返回要设置的 CUDA_VISIBLE_DEVICES; None 表示不设置 (所有 GPU 可见)."""
+    cfg = load_cfg()
+    if spec is None:
+        spec = os.environ.get("CUDA_VISIBLE_DEVICES", cfg.get("default_gpus"))
+    if spec is None:
+        return None
+    spec = str(spec)
+    if spec.lower() in ("cpu", "none", ""):
+        return ""
+    if not cfg.get("allowed_gpus"):
+        return spec
+    allowed = set(str(cfg["allowed_gpus"]).split(","))
+    bad = [g for g in spec.split(",") if g not in allowed]
+    if bad and not force:
+        sys.exit(f"jb: GPU {','.join(bad)} 不在允许列表 {cfg['allowed_gpus']} 中 (用 --force 强制)")
+    return spec
+
+
+def gpu_env(gpus):
+    return {} if gpus is None else {"CUDA_VISIBLE_DEVICES": gpus}
+
+
+def gpu_label(m):
+    g = m.get("env", {}).get("CUDA_VISIBLE_DEVICES")
+    return "all" if g is None else g or "cpu"
+
+
+def do_submit(spec, check=True):
+    jid = new_id()
+    d = jdir(jid)
+    spec = dict(spec, id=jid, submitted=time.time())
+    spec.setdefault("log", os.path.join(d, "out.log"))
+    spec["name"] = spec.get("name") or guess_name(spec["cmd"])
+    spec["git"] = git_rev(spec["cwd"])
+    write_json(os.path.join(d, "meta.json"), spec)
+    with open(os.path.join(d, "runner.log"), "ab") as rl:
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_run", str(jid)],
+                             stdin=subprocess.DEVNULL, stdout=rl, stderr=subprocess.STDOUT,
+                             start_new_session=True, cwd=spec["cwd"])
+    gpu = gpu_label(spec)
+    after = f" after={','.join(map(str, spec['after']))}" if spec.get("after") else ""
+    print(f"job {jid} ({spec['name']}) 已提交  gpu={gpu}{after}")
+    print(f"  log: {spec['log']}")
+    if check and not spec.get("after"):
+        for _ in range(6):
+            time.sleep(0.5)
+            if "end" in read_json(os.path.join(d, "meta.json")):
+                break
+        if p.poll() is not None and "end" not in read_json(os.path.join(d, "meta.json")):
+            print(f"  !! runner 启动失败, 见 {os.path.join(d, 'runner.log')}")
+        m = read_json(os.path.join(d, "meta.json"))
+        st = status(m)
+        if st not in ACTIVE:
+            print(f"  !! 任务已立即结束: {color(st)} rc={m.get('rc')}")
+            for line in tail_lines(spec["log"], 15):
+                print("  | " + line)
+    return jid
+
+
+def cmd_submit(a):
+    if not a.cmd:
+        sys.exit("jb: 缺少命令, 用法: jb submit [opts] -- CMD ...")
+    toks = a.cmd[1:] if a.cmd[0] == "--" else a.cmd
+    cmd = toks[0] if len(toks) == 1 else shlex.join(toks)
+    cwd = os.path.abspath(a.cwd or os.getcwd())
+    spec = {
+        "cmd": cmd, "cwd": cwd, "name": a.name, "note": a.note,
+        "env": gpu_env(parse_gpus(a.gpu, a.force)),
+        "total": a.total, "pattern": a.pattern,
+        "after": [int(x) for x in a.after.split(",")] if a.after else [],
+        "after_any": a.after_any,
+        "notify": True if a.notify else False if a.no_notify else None,
+    }
+    if a.log:
+        spec["log"] = os.path.abspath(os.path.join(cwd, a.log))
+    do_submit(spec, check=not a.no_check)
+
+
+def job_row(jid):
+    m = read_json(os.path.join(jdir(jid), "meta.json"))
+    if m is None:
+        return None
+    st = status(m)
+    p = progress(jid)
+    return {
+        "id": jid, "name": m.get("name"), "status": st,
+        "gpu": gpu_label(m),
+        "elapsed": elapsed(m), "done": p.get("done"), "total": p.get("total"),
+        "eta": eta_now(m, st, p), "rc": m.get("rc"), "submitted": m.get("submitted"),
+        "last_line": p.get("last_line", ""), "cmd": m.get("cmd"), "note": m.get("note"),
+        "_p": p,
+    }
+
+
+def cmd_ls(a):
+    ids = all_ids()
+    rows = [r for r in (job_row(j) for j in ids) if r]
+    if not a.all:
+        active = [r for r in rows if r["status"] in ACTIVE]
+        others = [r for r in rows if r["status"] not in ACTIVE][-a.n:] if a.n else []
+        rows = sorted(active + others, key=lambda r: r["id"])
+    if a.json:
+        print(json.dumps([{k: v for k, v in r.items() if k != "_p"} for r in rows], ensure_ascii=False, indent=1))
+        return
+    if not rows:
+        print("(没有任务)")
+        return
+    head = ["ID", "NAME", "STATUS", "GPU", "ELAPSED", "PROGRESS", "ETA", "SUBMITTED"]
+    table = []
+    for r in rows:
+        st = r["status"] + (f"({r['rc']})" if r["status"] == "failed" else "")
+        table.append([str(r["id"]), (r["name"] or "")[:24], st, r["gpu"], fmt_dur(r["elapsed"]),
+                      prog_str(r["_p"]), fmt_dur(r["eta"]), fmt_time(r["submitted"])])
+    widths = [max(len(x) for x in col) for col in zip(head, *table)]
+    print("  ".join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
+    for r, row in zip(rows, table):
+        cells = [c.ljust(w) for c, w in zip(row, widths)]
+        cells[2] = color(r["status"], cells[2])
+        print("  ".join(cells).rstrip())
+        if a.verbose and r["last_line"]:
+            print("      > " + r["last_line"][:160])
+
+
+def cmd_show(a):
+    m = meta(a.id)
+    st = status(m)
+    p = progress(a.id)
+    print(f"job {a.id}  {m.get('name')}  [{color(st)}]" + (f"  rc={m['rc']}" if "end" in m else ""))
+    if m.get("note"):
+        print(f"  note     : {m['note']}")
+    if m.get("reason"):
+        print(f"  reason   : {m['reason']}")
+    print(f"  cmd      : {m['cmd']}")
+    print(f"  cwd      : {m['cwd']}" + (f"   git {m['git']}" if m.get("git") else ""))
+    print(f"  gpu      : {gpu_label(m)}"
+          f"   pid {m.get('child_pid', '-')}" + (f"   after {m['after']}" if m.get("after") else ""))
+    print(f"  time     : submitted {fmt_time(m.get('submitted'))}  start {fmt_time(m.get('start'))}"
+          f"  end {fmt_time(m.get('end'))}  elapsed {fmt_dur(elapsed(m))}")
+    if p.get("done") is not None:
+        rate = p.get("rate")
+        rate_s = "-" if not rate else (f"{rate:.3g}/s" if rate >= 1 else f"{rate * 60:.3g}/min")
+        print(f"  progress : {prog_str(p)}  (via {p.get('source')})  rate {rate_s}  "
+              f"ETA {fmt_dur(eta_now(m, st, p))}  updated {fmt_dur(time.time() - p['updated'])} ago")
+    print(f"  log      : {m['log']}")
+    print("  ---- tail ----")
+    for line in tail_lines(m["log"], a.n):
+        print("  " + line)
+
+
+def cmd_log(a):
+    m = meta(a.id)
+    if a.raw and not a.follow:
+        with open(m["log"], "rb") as f:
+            shutil.copyfileobj(f, sys.stdout.buffer)
+        return
+    lines = tail_lines(m["log"], 0 if a.grep else a.n)
+    if a.grep:
+        pat = re.compile(a.grep)
+        lines = [l for l in lines if pat.search(l)]
+        lines = lines[-a.n:] if a.n else lines
+    for line in lines:
+        print(line)
+    if not a.follow:
+        return
+    sys.stdout.flush()
+    with open(m["log"], "rb") as f:
+        f.seek(0, 2)
+        try:
+            while True:
+                data = f.read()
+                if data:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+                elif status(read_json(os.path.join(jdir(a.id), "meta.json"))) not in ACTIVE:
+                    break
+                else:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            return
+    m = meta(a.id)
+    print(f"\n[jb] job {a.id} {status(m)} rc={m.get('rc')}")
+
+
+def cmd_wait(a):
+    pending = set(a.ids)
+    deadline = time.time() + a.timeout if a.timeout else None
+    ok = True
+    while pending:
+        for jid in sorted(pending):
+            m = meta(jid)
+            st = status(m)
+            if st not in ACTIVE:
+                pending.discard(jid)
+                ok &= st == "done"
+                print(f"job {jid} ({m.get('name')}) {st} rc={m.get('rc')} elapsed {fmt_dur(elapsed(m))}", flush=True)
+                if st != "done":
+                    for line in tail_lines(m["log"], a.tail):
+                        print("  | " + line)
+        if pending:
+            if deadline and time.time() > deadline:
+                print(f"jb: 超时, 仍在运行: {sorted(pending)}")
+                sys.exit(124)
+            time.sleep(a.interval)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_kill(a):
+    sig = signal.SIGKILL if a.hard else signal.SIGTERM
+    for jid in a.ids:
+        m = meta(jid)
+        st = status(m)
+        if st not in ACTIVE and st != "lost":
+            print(f"job {jid} 已结束 ({st})")
+            continue
+        open(os.path.join(jdir(jid), "killed"), "w").close()
+        if st == "running":
+            try:
+                os.killpg(m["child_pid"], sig)
+            except ProcessLookupError:
+                pass
+            print(f"job {jid} 已发送 {sig.name}")
+        elif st == "queued":
+            print(f"job {jid} 已取消 (排队中)")
+        else:
+            m.update(end=time.time(), rc=None, killed=True)
+            write_json(os.path.join(jdir(jid), "meta.json"), m)
+            print(f"job {jid} (lost) 标记为 killed")
+
+
+def cmd_retry(a):
+    m = meta(a.id)
+    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify")}
+    spec["after"], spec["after_any"] = [], False
+    if a.gpu is not None:
+        spec["env"] = gpu_env(parse_gpus(a.gpu, a.force))
+    if m["log"] != os.path.join(jdir(a.id), "out.log"):
+        spec["log"] = m["log"]
+    do_submit(spec)
+
+
+def cmd_gpu(a):
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout
+    except Exception as e:
+        sys.exit(f"jb: nvidia-smi 失败: {e}")
+    users = {}
+    for jid in all_ids():
+        m = read_json(os.path.join(jdir(jid), "meta.json"))
+        if m and status(m) == "running":
+            for g in (m.get("env", {}).get("CUDA_VISIBLE_DEVICES") or "").split(","):
+                if g:
+                    users.setdefault(g, []).append(f"{jid}:{m.get('name')}")
+    allowed_cfg = load_cfg().get("allowed_gpus")
+    allowed = set(str(allowed_cfg).split(",")) if allowed_cfg else None
+    for line in out.strip().splitlines():
+        idx, util, used, total = [x.strip() for x in line.split(",")]
+        tag = "" if allowed is None or idx in allowed else " (off)"
+        print(f"GPU {idx}{tag:6}  util {util:>3}%  mem {int(used):>5}/{total} MiB  jobs: {', '.join(users.get(idx, [])) or '-'}")
+
+
+def cmd_rm(a):
+    for jid in a.ids:
+        m = meta(jid)
+        if status(m) in ACTIVE:
+            print(f"job {jid} 仍在运行, 跳过 (先 jb kill)")
+            continue
+        shutil.rmtree(jdir(jid))
+        print(f"job {jid} 已删除")
+
+
+def cmd_clean(a):
+    cutoff = time.time() - a.days * 86400
+    n = 0
+    for jid in all_ids():
+        m = read_json(os.path.join(jdir(jid), "meta.json"))
+        if m and status(m) not in ACTIVE and m.get("end", m.get("submitted", 0)) < cutoff:
+            shutil.rmtree(jdir(jid))
+            n += 1
+    print(f"删除了 {n} 个 {a.days} 天前结束的任务")
+
+
+# ---------------------------------------------------------------- web dashboard
+
+HIST_LEN = 180  # 采样点数 (默认 2s 一次, 约 6 分钟)
+
+
+def _num(x):
+    try:
+        return float(x)
+    except ValueError:
+        return None
+
+
+def proc_info(pid):
+    info = {"pid": pid, "user": "?", "cmd": "", "sid": None, "pgrp": None}
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            rest = f.read().rsplit(")", 1)[1].split()
+        info["pgrp"], info["sid"] = int(rest[2]), int(rest[3])
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        info["cmd"] = cmd.replace(os.path.expanduser("~"), "~")[:400]
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    info["user"] = pwd.getpwuid(int(line.split()[1])).pw_name
+                    break
+    except (FileNotFoundError, ProcessLookupError, PermissionError, KeyError, IndexError, ValueError):
+        pass
+    return info
+
+
+def query_gpus(job_pids):
+    fields = "index,uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed"
+    out = subprocess.run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, timeout=10).stdout
+    gpus, by_uuid = [], {}
+    for line in out.strip().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        g = {"index": p[0], "name": p[2], "util": _num(p[3]), "mem_used": _num(p[4]), "mem_total": _num(p[5]),
+             "temp": _num(p[6]), "power": _num(p[7]), "power_limit": _num(p[8]), "fan": _num(p[9]), "procs": []}
+        g["mem_pct"] = 100 * g["mem_used"] / g["mem_total"] if g["mem_used"] is not None and g["mem_total"] else None
+        gpus.append(g)
+        by_uuid[p[1]] = g
+    out = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, timeout=10).stdout
+    for line in out.strip().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 3 or p[0] not in by_uuid:
+            continue
+        info = proc_info(int(p[1]))
+        info["mem"] = _num(p[2])
+        info["job"] = job_pids.get(info["sid"]) or job_pids.get(info["pgrp"])
+        by_uuid[p[0]]["procs"].append(info)
+    for g in gpus:
+        g["procs"].sort(key=lambda x: -(x["mem"] or 0))
+    return gpus
+
+
+def host_info():
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) * 1024
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+    disk = shutil.disk_usage(os.path.expanduser("~"))
+    return {
+        "hostname": socket.gethostname(), "ncpu": os.cpu_count(), "load": os.getloadavg(), "uptime": uptime,
+        "mem_total": mem["MemTotal"], "mem_used": mem["MemTotal"] - mem.get("MemAvailable", mem["MemFree"]),
+        "disk_total": disk.total, "disk_used": disk.used,
+    }
+
+
+class Sampler(threading.Thread):
+    def __init__(self, interval):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.state = {}
+        self.hist = {}
+        self.host_hist = deque(maxlen=HIST_LEN)
+        self._cpu_prev = None
+
+    def _cpu_pct(self):
+        with open("/proc/stat") as f:
+            vals = list(map(int, f.readline().split()[1:9]))
+        idle, total = vals[3] + vals[4], sum(vals)
+        prev, self._cpu_prev = self._cpu_prev, (idle, total)
+        if not prev or total == prev[1]:
+            return None
+        return 100 * (1 - (idle - prev[0]) / (total - prev[1]))
+
+    def sample(self):
+        now = time.time()
+        job_pids = {}
+        for jid in all_ids():
+            m = read_json(os.path.join(jdir(jid), "meta.json"))
+            if m and m.get("child_pid") and "end" not in m:
+                job_pids[m["child_pid"]] = {"id": jid, "name": m.get("name")}
+        try:
+            gpus, err = query_gpus(job_pids), None
+        except Exception as e:
+            gpus, err = [], f"nvidia-smi: {e}"
+        host = host_info()
+        host["cpu"] = self._cpu_pct()
+        host["mem_pct"] = 100 * host["mem_used"] / host["mem_total"]
+        for g in gpus:
+            self.hist.setdefault(g["index"], deque(maxlen=HIST_LEN)).append([round(now, 1), g["util"], g["mem_pct"]])
+        self.host_hist.append([round(now, 1), host["cpu"], host["mem_pct"]])
+        with self.lock:
+            self.state = {"t": now, "gpus": gpus, "host": host, "error": err}
+
+    def run(self):
+        while True:
+            try:
+                self.sample()
+            except Exception as e:
+                with self.lock:
+                    self.state = dict(self.state, error=str(e))
+            time.sleep(self.interval)
+
+    def snapshot(self):
+        with self.lock:
+            s = dict(self.state)
+            s["gpus"] = [dict(g, hist=list(self.hist.get(g["index"], []))) for g in s.get("gpus", [])]
+            s["host"] = dict(s.get("host", {}), hist=list(self.host_hist))
+        return s
+
+
+def jobs_state(n_finished=30):
+    rows = [r for r in (job_row(j) for j in all_ids()) if r]
+    active = [r for r in rows if r["status"] in ACTIVE]
+    rows = sorted(active + [r for r in rows if r["status"] not in ACTIVE][-n_finished:], key=lambda r: -r["id"])
+    out = []
+    for r in rows:
+        p = r.pop("_p")
+        r.update(rate=p.get("rate"), source=p.get("source"),
+                 updated=p.get("updated"), cmd=(r["cmd"] or "").replace(os.path.expanduser("~"), "~"))
+        out.append(r)
+    return out
+
+
+def dashboard_html():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for p in (os.path.join(here, "dashboard.html"), os.path.expanduser("~/.local/share/jb/dashboard.html")):
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+    return "<h1>dashboard.html not found</h1>"
+
+
+def make_handler(sampler, token):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            body = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            if token:
+                given = qs.get("token", [""])[0] or self.headers.get("X-Token", "")
+                if not hmac.compare_digest(given, token):
+                    return self._send(401, "unauthorized: append ?token=...", "text/plain; charset=utf-8")
+            path = u.path.rstrip("/").rsplit("/api/", 1)
+            if len(path) == 1:
+                return self._send(200, dashboard_html(), "text/html; charset=utf-8")
+            if path[1] == "state":
+                s = sampler.snapshot()
+                s.update(jobs=jobs_state(), cfg=load_cfg(), now=time.time())
+                return self._send(200, json.dumps(s, ensure_ascii=False))
+            if path[1] == "log":
+                try:
+                    jid = int(qs["id"][0])
+                    n = min(int(qs.get("n", ["300"])[0]), 5000)
+                except (KeyError, ValueError):
+                    return self._send(400, '{"error":"bad id"}')
+                m = read_json(os.path.join(jdir(jid), "meta.json"))
+                if m is None:
+                    return self._send(404, '{"error":"no such job"}')
+                return self._send(200, json.dumps({"id": jid, "status": status(m), "lines": tail_lines(m["log"], n)},
+                                                  ensure_ascii=False))
+            self._send(404, '{"error":"not found"}')
+
+    return Handler
+
+
+def cmd_serve(a):
+    pidfile = os.path.join(HOME, "serve.pid")
+    old = read_json(pidfile, {})
+    if a.stop or a.status:
+        alive = pid_alive(old.get("pid"), "serve")
+        if a.status:
+            print(f"dashboard 运行中: pid {old['pid']}  http://{old['host']}:{old['port']}/" if alive else "dashboard 未运行")
+        elif alive:
+            os.kill(old["pid"], signal.SIGTERM)
+            print(f"已停止 dashboard (pid {old['pid']})")
+        else:
+            print("dashboard 未运行")
+        return
+    a.token = a.token or os.environ.get("JB_TOKEN") or None
+    if a.daemon:
+        if pid_alive(old.get("pid"), "serve"):
+            sys.exit(f"jb: dashboard 已在运行 (pid {old['pid']}), 先 jb serve --stop")
+        os.makedirs(HOME, exist_ok=True)
+        args = [sys.executable, os.path.abspath(__file__), "serve", "--host", a.host, "--port", str(a.port),
+                "--interval", str(a.interval)]
+        env = dict(os.environ, JB_TOKEN=a.token or "")
+        with open(os.path.join(HOME, "serve.log"), "ab") as lf:
+            p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                                 start_new_session=True, env=env)
+        write_json(pidfile, {"pid": p.pid, "host": a.host, "port": a.port})
+        time.sleep(1)
+        if p.poll() is not None:
+            sys.exit(f"jb: dashboard 启动失败, 见 {os.path.join(HOME, 'serve.log')}")
+        print(f"dashboard 已在后台启动: pid {p.pid}  http://{a.host}:{a.port}/" + ("?token=***" if a.token else ""))
+        return
+    a.token = a.token or os.environ.get("JB_TOKEN") or None
+    if a.host not in ("127.0.0.1", "localhost") and not a.token:
+        sys.exit("jb: 绑定非本地地址时必须设置 --token")
+    sampler = Sampler(a.interval)
+    sampler.sample()
+    sampler.start()
+    srv = ThreadingHTTPServer((a.host, a.port), make_handler(sampler, a.token))
+    print(f"jb dashboard: http://{a.host}:{a.port}/", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "_run":
+        return run_job(int(sys.argv[2]))
+    ap = argparse.ArgumentParser(prog="jb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="sub")
+
+    s = sub.add_parser("submit", aliases=["sub", "run"], help="提交后台任务")
+    s.add_argument("-n", "--name")
+    s.add_argument("-g", "--gpu", help="如 0 或 0,1 或 cpu; 默认继承 CUDA_VISIBLE_DEVICES 或配置的 default_gpus")
+    s.add_argument("-C", "--cwd", help="工作目录, 默认当前目录")
+    s.add_argument("--total", type=float, help="总步数, 配合 --pattern 计算进度")
+    s.add_argument("--pattern", help=f"提取已完成步数的正则 (第1组=done, 可选第2组=total), 默认 {DEFAULT_PATTERN}")
+    s.add_argument("--after", help="等这些任务 (逗号分隔) 成功结束后再开始")
+    s.add_argument("--after-any", action="store_true", help="依赖任务失败也照样开始")
+    s.add_argument("--log", help="日志路径 (默认 ~/.jb/jobs/ID/out.log)")
+    s.add_argument("--note", help="备注")
+    s.add_argument("--force", action="store_true", help="允许使用不在 allowed_gpus 中的 GPU")
+    s.add_argument("--no-check", action="store_true", help="不检查任务是否立即崩溃")
+    s.add_argument("--notify", action="store_true", help="结束时一定推送 (忽略 min_seconds)")
+    s.add_argument("--no-notify", action="store_true", help="结束时不推送")
+    s.add_argument("cmd", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("ls", aliases=["ps", "list"], help="列出任务")
+    s.add_argument("-a", "--all", action="store_true", help="显示全部历史任务")
+    s.add_argument("-n", type=int, default=8, help="额外显示最近 N 个已结束任务 (默认 8)")
+    s.add_argument("-v", "--verbose", action="store_true", help="显示每个任务日志最后一行")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("show", aliases=["info"], help="任务详情")
+    s.add_argument("id", type=int)
+    s.add_argument("-n", type=int, default=15, help="日志尾部行数")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("log", aliases=["logs", "tail"], help="查看日志")
+    s.add_argument("id", type=int)
+    s.add_argument("-n", type=int, default=40, help="行数, 0=全部")
+    s.add_argument("-f", "--follow", action="store_true", help="持续输出直到任务结束")
+    s.add_argument("--grep", help="只显示匹配正则的行")
+    s.add_argument("--raw", action="store_true", help="原样输出 (不折叠 \\r)")
+    s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("wait", help="等待任务结束")
+    s.add_argument("ids", type=int, nargs="+")
+    s.add_argument("--timeout", type=float, help="秒, 超时退出码 124")
+    s.add_argument("--interval", type=float, default=5)
+    s.add_argument("--tail", type=int, default=20, help="失败时打印的日志行数")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("kill", aliases=["stop", "cancel"], help="终止任务")
+    s.add_argument("ids", type=int, nargs="+")
+    s.add_argument("-9", "--hard", action="store_true", help="SIGKILL")
+    s.set_defaults(fn=cmd_kill)
+
+    s = sub.add_parser("retry", aliases=["rerun"], help="以相同参数重新提交")
+    s.add_argument("id", type=int)
+    s.add_argument("-g", "--gpu")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_retry)
+
+    s = sub.add_parser("gpu", help="GPU 占用")
+    s.set_defaults(fn=cmd_gpu)
+
+    s = sub.add_parser("serve", aliases=["web"], help="网页 dashboard")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=18765)
+    s.add_argument("--token", help="访问口令 (也可用环境变量 JB_TOKEN); 绑定非本地地址时必须")
+    s.add_argument("--interval", type=float, default=2.0, help="采样间隔秒")
+    s.add_argument("-d", "--daemon", action="store_true", help="后台运行")
+    s.add_argument("--stop", action="store_true", help="停止后台 dashboard")
+    s.add_argument("--status", action="store_true")
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("notify", help="配置任务结束推送 (微信/QQ/手机)")
+    s.add_argument("action", choices=["show", "set", "test"], nargs="?", default="show")
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.set_defaults(fn=cmd_notify)
+
+    s = sub.add_parser("rm", help="删除任务记录 (含默认位置的日志)")
+    s.add_argument("ids", type=int, nargs="+")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("clean", help="删除 N 天前结束的任务")
+    s.add_argument("--days", type=float, default=14)
+    s.set_defaults(fn=cmd_clean)
+
+    a = ap.parse_args()
+    if not a.sub:
+        a = ap.parse_args(["ls"])
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

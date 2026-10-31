@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jb dashboard</title>
+<style>
+:root{
+  --bg:#f6f7f9;--card:#ffffff;--line:#e6e8ec;--line2:#d5d9df;
+  --ink:#1c2026;--text:#353b45;--dim:#7b8390;--faint:#adb3bc;--track:#eef0f3;
+  --accent:#3b5bdb;--accent-soft:#e8edfc;--accent2:#9aa3b0;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 var(--sans)}
+.n{font-family:var(--mono);font-variant-numeric:tabular-nums}
+header{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;gap:6px 26px;padding:12px 24px;
+  background:#f6f7f9ee;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.brand{font-weight:650;font-size:15px;color:var(--ink);display:flex;align-items:center;gap:8px}
+.brand .host{color:var(--dim);font-weight:400;font-family:var(--mono);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 2s infinite}
+.dot.stale{background:var(--faint);animation:none}
+@keyframes pulse{50%{opacity:.25}}
+.hs{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px}
+.hs .v{color:var(--ink);font-family:var(--mono);font-size:12px}
+.mini{width:56px;height:4px;background:var(--track);border-radius:2px;overflow:hidden}
+.mini i{display:block;height:100%;background:var(--ink);transition:width .6s ease}
+.spacer{flex:1}
+.clock{color:var(--dim);font-family:var(--mono);font-size:12px}
+main{padding:8px 24px 40px;max-width:1500px;margin:0 auto}
+h2{font-size:12px;font-weight:600;color:var(--dim);margin:22px 0 10px;display:flex;align-items:center;gap:10px}
+h2 .cnt{color:var(--faint);font-weight:400}
+.err{color:var(--ink);background:var(--card);border:1px solid var(--line2);border-left:3px solid var(--ink);padding:8px 12px;border-radius:6px;margin-top:14px}
+
+.gpus{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.gpu{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px 12px}
+.gpu.off{background:transparent;border-style:dashed}
+.gpu.off .gidx,.gpu.off .r{color:var(--dim)}
+.gtop{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
+.gidx{font-size:15px;font-weight:650;color:var(--ink)}
+.gname{color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font-size:11px;color:var(--faint);margin-left:auto;white-space:nowrap}
+.brow{display:grid;grid-template-columns:34px 1fr 92px;align-items:center;gap:10px;margin-top:8px}
+.brow .l{color:var(--dim);font-size:11px}
+.brow .r{text-align:right;color:var(--ink);font-family:var(--mono);font-size:12px}
+.bar{height:6px;background:var(--track);border-radius:3px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:3px;transition:width .6s ease}
+.bar.u i{background:var(--accent)} .bar.m i{background:var(--accent2)}
+.gpu.off .bar i{background:var(--faint)}
+.gmeta{display:flex;gap:18px;color:var(--dim);margin-top:10px;font-size:12px}
+.gmeta b{color:var(--text);font-weight:500;font-family:var(--mono)}
+.spark{display:block;width:100%;height:40px;margin-top:10px}
+.procs{margin-top:10px;border-top:1px solid var(--line);padding-top:8px;font-size:12px;min-height:26px}
+.proc{display:grid;grid-template-columns:64px 76px 52px 1fr;gap:8px;color:var(--dim);white-space:nowrap;padding:1px 0;font-family:var(--mono);font-size:11.5px}
+.proc .cmd{overflow:hidden;text-overflow:ellipsis}
+.proc.mine{color:var(--ink)}
+.tag{color:var(--accent);background:var(--accent-soft);border-radius:4px;padding:0 6px;margin-right:6px;cursor:pointer;font-weight:600}
+.none{color:var(--faint)}
+
+.tools{display:flex;gap:2px;margin-left:auto;background:var(--track);border-radius:7px;padding:2px}
+.btn{background:transparent;color:var(--dim);border:0;border-radius:5px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+.btn.on{background:var(--card);color:var(--ink);box-shadow:0 1px 2px #0000000f}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{width:100%;border-collapse:collapse}
+th,td{padding:9px 14px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500;font-size:11.5px}
+tbody tr{cursor:pointer;transition:background .12s}
+tbody tr:hover{background:#f9fafb}
+tbody tr.sel{background:var(--accent-soft)}
+tbody tr:last-child td{border-bottom:0}
+.jid{color:var(--faint);font-family:var(--mono)}
+.jname{font-weight:600;color:var(--ink)}
+.st{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+.st::before{content:"";width:7px;height:7px;border-radius:50%;border:1.5px solid currentColor;box-sizing:border-box}
+.st-running{color:var(--accent)} .st-running::before{background:currentColor;animation:pulse 1.4s infinite}
+.st-queued::before{border-style:dashed}
+.st-done{color:var(--text)} .st-done::before{background:currentColor}
+.st-failed{color:var(--ink);font-weight:650} .st-failed::before{content:"✕";border:0;width:auto;height:auto;font-size:11px}
+.st-killed::before,.st-cancelled::before,.st-lost::before{border-radius:1px}
+.pg{display:flex;align-items:center;gap:10px}
+.pgb{width:140px;height:5px;background:var(--track);border-radius:3px;overflow:hidden}
+.pgb i{display:block;height:100%;border-radius:3px;background:var(--faint);transition:width .6s ease}
+.pgb.run i{background:var(--accent)}
+.pct{color:var(--faint)}
+.last{color:var(--dim);max-width:420px;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono);font-size:11.5px}
+.empty{padding:30px;text-align:center;color:var(--faint)}
+
+#drawer{position:fixed;left:0;right:0;bottom:0;height:46vh;background:var(--card);border-top:1px solid var(--line2);box-shadow:0 -8px 24px #0000000d;
+  transform:translateY(102%);transition:transform .22s ease;z-index:20;display:flex;flex-direction:column}
+#drawer.open{transform:none}
+.dh{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.dh .t{font-weight:650;color:var(--ink)}
+.dh .c{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:120px;font-family:var(--mono);font-size:11.5px}
+.dh .btn{border:1px solid var(--line2)}
+#log{flex:1;overflow:auto;margin:0;padding:12px 20px;font:12px/1.55 var(--mono);color:var(--text);white-space:pre-wrap;word-break:break-all;background:#fbfbfc}
+#log .e{color:var(--ink);font-weight:650}
+body.drawer-open main{padding-bottom:50vh}
+
+@media (max-width:640px){
+  header,main{padding-left:16px;padding-right:16px}
+  .gpus{grid-template-columns:1fr}
+  .mini{display:none}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot" id="dot"></span>jb<span class="host" id="host"></span></div>
+  <div class="hs">CPU <span class="mini"><i id="cpuBar"></i></span><span class="v" id="cpu">-</span></div>
+  <div class="hs">内存 <span class="mini"><i id="memBar"></i></span><span class="v" id="mem">-</span></div>
+  <div class="hs">负载 <span class="v" id="load">-</span></div>
+  <div class="hs">磁盘 <span class="v" id="disk">-</span></div>
+  <div class="hs">运行 <span class="v" id="up">-</span></div>
+  <div class="spacer"></div>
+  <div class="clock" id="clock"></div>
+</header>
+<main>
+  <div class="err" id="err" hidden></div>
+  <h2>GPU <span class="cnt" id="gcnt"></span></h2>
+  <div class="gpus" id="gpus"></div>
+  <h2>任务 <span class="cnt" id="jcnt"></span>
+    <span class="tools"><button class="btn on" id="fRecent">全部</button><button class="btn" id="fActive">运行中</button></span>
+  </h2>
+  <div class="tw"><table>
+    <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>GPU</th><th>进度</th><th>ETA</th><th>已运行</th><th>提交</th><th>最后输出</th></tr></thead>
+    <tbody id="jobs"></tbody>
+  </table></div>
+</main>
+<div id="drawer">
+  <div class="dh"><span class="t" id="dTitle"></span><span id="dSt"></span><span class="c" id="dCmd"></span>
+    <button class="btn" id="dFollow">自动滚动: 开</button><button class="btn" id="dClose">关闭</button></div>
+  <pre id="log"></pre>
+</div>
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const api = p => 'api/' + p + (TOKEN ? (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : '');
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ACTIVE = ['running', 'queued'];
+const ST = {running:'运行中', queued:'排队', done:'完成', failed:'失败', killed:'已终止', cancelled:'已取消', lost:'丢失'};
+let state = null, sel = null, onlyActive = false, follow = true, lastOk = 0, logTimer = null;
+
+function dur(s) {
+  if (s == null) return '-';
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  const p = n => String(n).padStart(2, '0');
+  if (d) return `${d}d${p(h)}h${p(m)}m`;
+  return h ? `${h}:${p(m)}:${p(x)}` : `${m}:${p(x)}`;
+}
+const ago = s => s == null || isNaN(s) ? '-' : s < 60 ? '刚刚' : s < 3600 ? `${Math.floor(s / 60)} 分钟前`
+  : s < 86400 ? `${Math.floor(s / 3600)} 小时前` : `${Math.floor(s / 86400)} 天前`;
+const gb = b => (b / 1073741824).toFixed(b >= 1e12 ? 0 : 1) + 'G';
+const num = x => Number.isInteger(x) ? String(x) : (+x).toPrecision(4).replace(/\.?0+$/, '');
+const tstr = t => t ? new Date(t * 1000).toLocaleString('zh-CN', {hour12: false}) : '-';
+const fx = (x, d = 0, u = '') => x == null ? '-' : x.toFixed(d) + u;
+
+function renderHost(h) {
+  $('host').textContent = h.hostname || '';
+  $('cpu').textContent = fx(h.cpu, 0, '%');
+  $('cpuBar').style.width = (h.cpu || 0) + '%';
+  $('mem').textContent = h.mem_used ? `${gb(h.mem_used)} / ${gb(h.mem_total)}` : '-';
+  $('memBar').style.width = (h.mem_pct || 0) + '%';
+  $('load').textContent = h.load ? h.load.map(x => x.toFixed(1)).join(' ') + ` · ${h.ncpu} 核` : '-';
+  $('disk').textContent = h.disk_total ? `${gb(h.disk_used)} / ${gb(h.disk_total)}` : '-';
+  $('up').textContent = dur(h.uptime);
+}
+
+function spark(hist, now) {
+  const W = 300, H = 40, span = 360, y = v => H - 1 - (v / 100) * (H - 2);
+  const pts = k => hist.filter(p => p[k] != null).map(p => `${(((p[0] - (now - span)) / span) * W).toFixed(1)},${y(p[k]).toFixed(1)}`);
+  const u = pts(1), m = pts(2);
+  const area = u.length ? `M${u[0].split(',')[0]},${H} L${u.join(' L')} L${u[u.length - 1].split(',')[0]},${H} Z` : '';
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line x1="0" x2="${W}" y1="${y(50)}" y2="${y(50)}" stroke="#e6e8ec" stroke-dasharray="2 4"/>
+    <path d="${area}" fill="#3b5bdb" fill-opacity=".07"/>
+    <polyline points="${m.join(' ')}" fill="none" stroke="#9aa3b0" stroke-width="1.2" vector-effect="non-scaling-stroke"/>
+    <polyline points="${u.join(' ')}" fill="none" stroke="#3b5bdb" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+}
+
+function renderGpus(gpus, cfg, now) {
+  const allowed = String(cfg.allowed_gpus || '').split(',');
+  const busy = gpus.filter(g => (g.util || 0) > 5 || (g.mem_pct || 0) > 10).length;
+  $('gcnt').textContent = `${busy}/${gpus.length} 在用 · 蓝线=利用率 灰线=显存 (近 6 分钟)`;
+  $('gpus').innerHTML = gpus.map(g => {
+    const ok = !cfg.allowed_gpus || allowed.includes(g.index);
+    const mem = g.mem_used == null ? '-' : `${(g.mem_used / 1024).toFixed(1)} / ${(g.mem_total / 1024).toFixed(0)}G`;
+    const procs = g.procs.length ? g.procs.map(p => `<div class="proc ${p.job ? 'mine' : ''}">
+        <span>${p.pid}</span><span>${esc(p.user).slice(0, 10)}</span><span>${p.mem == null ? '-' : (p.mem / 1024).toFixed(1) + 'G'}</span>
+        <span class="cmd" title="${esc(p.cmd)}">${p.job ? `<span class="tag" data-job="${p.job.id}">#${p.job.id} ${esc(p.job.name)}</span>` : ''}${esc(p.cmd)}</span></div>`).join('')
+      : '<div class="none">空闲</div>';
+    return `<div class="gpu ${ok ? '' : 'off'}">
+      <div class="gtop"><span class="gidx">GPU ${g.index}</span><span class="gname">${esc(g.name.replace('NVIDIA GeForce ', ''))}</span>
+        <span class="badge">${ok ? '' : 'jb 不使用'}</span></div>
+      <div class="brow"><span class="l">利用率</span><div class="bar u"><i style="width:${g.util || 0}%"></i></div><span class="r">${fx(g.util, 0, '%')}</span></div>
+      <div class="brow"><span class="l">显存</span><div class="bar m"><i style="width:${g.mem_pct || 0}%"></i></div><span class="r">${mem}</span></div>
+      <div class="gmeta"><span>温度 <b>${fx(g.temp, 0, '°C')}</b></span><span>功耗 <b>${fx(g.power)}</b>/${fx(g.power_limit)}W</span><span>风扇 <b>${fx(g.fan, 0, '%')}</b></span></div>
+      ${spark(g.hist || [], now)}
+      <div class="procs">${procs}</div></div>`;
+  }).join('');
+}
+
+function renderJobs(jobs, now) {
+  const running = jobs.filter(j => j.status === 'running').length, queued = jobs.filter(j => j.status === 'queued').length;
+  $('jcnt').textContent = `${running} 运行中` + (queued ? ` · ${queued} 排队` : '');
+  const rows = onlyActive ? jobs.filter(j => ACTIVE.includes(j.status)) : jobs;
+  if (!rows.length) { $('jobs').innerHTML = `<tr><td colspan="9" class="empty">没有任务 · jb submit -- CMD</td></tr>`; return; }
+  $('jobs').innerHTML = rows.map(j => {
+    const pct = j.total ? Math.min(100, 100 * j.done / j.total) : null;
+    const prog = j.done == null ? '<span class="none">-</span>'
+      : `<div class="pg">${pct == null ? '' : `<div class="pgb ${j.status === 'running' ? 'run' : ''}"><i style="width:${pct}%"></i></div>`}
+         <span class="n">${num(j.done)}${j.total ? ' / ' + num(j.total) : ''}</span>${pct == null ? '' : `<span class="pct n">${pct.toFixed(0)}%</span>`}</div>`;
+    const st = (ST[j.status] || j.status) + (j.status === 'failed' && j.rc != null ? ` (${j.rc})` : '');
+    return `<tr data-id="${j.id}" class="${sel === j.id ? 'sel' : ''}">
+      <td class="jid">${j.id}</td><td class="jname">${esc(j.name)}</td>
+      <td><span class="st st-${j.status}">${st}</span></td><td class="n">${esc(j.gpu)}</td>
+      <td>${prog}</td><td class="n">${dur(j.eta)}</td><td class="n">${dur(j.elapsed)}</td>
+      <td title="${tstr(j.submitted)} (服务器时钟)">${ago(now - j.submitted)}</td><td class="last" title="${esc(j.last_line)}">${esc(j.last_line)}</td></tr>`;
+  }).join('');
+}
+
+async function tick() {
+  try {
+    const r = await fetch(api('state'), {cache: 'no-store'});
+    if (!r.ok) throw new Error(r.status === 401 ? '未授权: URL 需带 ?token=...' : 'HTTP ' + r.status);
+    state = await r.json();
+    lastOk = Date.now();
+    renderHost(state.host || {});
+    renderGpus(state.gpus || [], state.cfg || {}, state.now);
+    renderJobs(state.jobs || [], state.now);
+    $('err').hidden = !state.error; $('err').textContent = state.error || '';
+    if (sel != null) updateDrawerHead();
+  } catch (e) {
+    $('err').hidden = false; $('err').textContent = '连接失败: ' + e.message + ' (隧道是否在运行?)';
+  }
+}
+
+function updateDrawerHead() {
+  const j = (state?.jobs || []).find(x => x.id === sel);
+  if (!j) return;
+  $('dTitle').textContent = `#${j.id} ${j.name}`;
+  $('dSt').innerHTML = `<span class="st st-${j.status}">${ST[j.status] || j.status}</span>`;
+  $('dCmd').textContent = j.cmd; $('dCmd').title = j.cmd;
+}
+
+async function loadLog() {
+  if (sel == null) return;
+  try {
+    const r = await fetch(api(`log?id=${sel}&n=500`), {cache: 'no-store'});
+    const d = await r.json();
+    const el = $('log');
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    el.innerHTML = d.lines.map(l => /error|traceback|exception/i.test(l) ? `<span class="e">${esc(l)}</span>` : esc(l)).join('\n')
+      || '<span class="none">(日志为空)</span>';
+    if ((follow && atBottom) || el.dataset.first !== '0') { el.scrollTop = el.scrollHeight; el.dataset.first = '0'; }
+    clearTimeout(logTimer);
+    if (ACTIVE.includes(d.status)) logTimer = setTimeout(loadLog, 2500);
+  } catch (e) { $('log').textContent = '加载日志失败: ' + e.message; }
+}
+
+function openJob(id) {
+  sel = id;
+  $('log').dataset.first = '1'; $('log').textContent = '加载中…';
+  $('drawer').classList.add('open'); document.body.classList.add('drawer-open');
+  updateDrawerHead(); loadLog();
+  if (state) renderJobs(state.jobs || [], state.now);
+}
+function closeDrawer() {
+  sel = null; clearTimeout(logTimer);
+  $('drawer').classList.remove('open'); document.body.classList.remove('drawer-open');
+  if (state) renderJobs(state.jobs || [], state.now);
+}
+function setFilter(active) {
+  onlyActive = active;
+  $('fActive').classList.toggle('on', active); $('fRecent').classList.toggle('on', !active);
+  if (state) renderJobs(state.jobs || [], state.now);
+}
+
+$('jobs').addEventListener('click', e => { const tr = e.target.closest('tr[data-id]'); if (tr) openJob(+tr.dataset.id); });
+$('gpus').addEventListener('click', e => { const t = e.target.closest('[data-job]'); if (t) openJob(+t.dataset.job); });
+$('dClose').onclick = closeDrawer;
+$('dFollow').onclick = () => { follow = !follow; $('dFollow').textContent = '自动滚动: ' + (follow ? '开' : '关'); };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+$('fRecent').onclick = () => setFilter(false);
+$('fActive').onclick = () => setFilter(true);
+
+setInterval(() => {
+  $('clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+  $('dot').classList.toggle('stale', Date.now() - lastOk > 6000);
+}, 1000);
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>
