@@ -32,6 +32,20 @@ jb gpu                                                 # GPU 占用及对应任�
 
 **进度识别** (优先级从高到低): 脚本打印 `[jb] progress 120/1000` → 提交时 `--total 30000` (配合 `--pattern`, 默认匹配 `step 123`) → 日志里的 `epoch 3/10`、`step 12/100` → tqdm 进度条.
 
+## 分组 / 归档 / 批量清理
+
+```bash
+jb submit -G lf5 -n lf5-gated -- ...         # 提交时指定分组
+jb group lf5 208-211                         # 设分组 (ID 可写 208-211 / 208,210); jb group - ID 清除
+jb groups                                    # 各分组任务数
+jb archive 201-207 / jb unarchive 203        # 归档后 jb ls 和面板默认隐藏; jb ls -A 带上, --archived 只看归档
+jb ls -G lf5                                 # 只看某分组 (含全部历史)
+jb rm --match smoke --status done,failed     # 按名称正则 / 状态 / -G 分组批量删除, 会先列出再确认 (-y 跳过)
+```
+
+运行中 / 排队中的任务不会被归档或删除. 标注存放在 `~/.jb/jobs/<ID>/label.json`, 不改动 runner 读写的 meta.json.
+面板里: 最近 / 运行中 / 全部 / 已归档 四个标签页, 搜索, 分组筛选与按分组折叠, 勾选 (Shift 连选) 后批量设分组、按名称前缀自动分组、归档、删除; 勾选 \"隐藏 GPU\" 进入纯管理视图.
+
 ## 配置 `~/.jb/config.json`
 
 限制可用 GPU (可选, 默认不限制):

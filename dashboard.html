@@ -97,6 +97,29 @@ tbody tr:last-child td{border-bottom:0}
 #log .e{color:var(--ink);font-weight:650}
 body.drawer-open main{padding-bottom:50vh}
 
+.jbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 10px}
+.jbar input[type=search]{font:inherit;font-size:12px;padding:4px 10px;border:1px solid var(--line2);border-radius:7px;background:var(--card);color:var(--ink);width:220px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.chip{border:1px solid var(--line2);background:var(--card);color:var(--text);border-radius:999px;padding:1px 10px;font-size:12px;cursor:pointer}
+.chip .k{color:var(--faint);margin-left:4px;font-family:var(--mono);font-size:11px}
+.chip.on{background:var(--ink);color:#fff;border-color:var(--ink)} .chip.on .k{color:#ffffffaa}
+.gtag{display:inline-block;color:var(--accent);background:var(--accent-soft);border-radius:4px;padding:0 6px;font-size:11.5px;cursor:pointer}
+.arch{color:var(--faint);font-size:11px;margin-left:6px;border:1px solid var(--line2);border-radius:4px;padding:0 4px}
+tbody tr.archived td{opacity:.55}
+td.ck,th.ck{width:28px;padding-right:0}
+.ck input{cursor:pointer;margin:0}
+tr.ghead td{background:var(--bg);font-weight:600;color:var(--ink);cursor:pointer;padding:6px 14px}
+tr.ghead .k{color:var(--faint);font-weight:400;margin-left:8px}
+#bulk{position:sticky;top:52px;z-index:9;display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--ink);color:#fff;border-radius:9px;padding:7px 12px;margin:0 0 10px}
+#bulk[hidden]{display:none}
+#bulk .btn{color:#fff;border:1px solid #ffffff40}
+#bulk .btn:hover{background:#ffffff1a}
+#bulk .btn.danger{border-color:#ff8a8a;color:#ffb3b3}
+#bulk input{font:inherit;font-size:12px;padding:3px 8px;border-radius:5px;border:0;width:140px}
+#toast{position:fixed;right:20px;bottom:20px;background:var(--ink);color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;z-index:40;max-width:60vw;white-space:pre-wrap}
+#toast[hidden]{display:none}
+.hide-gpu #gpuSec{display:none}
+
 @media (max-width:640px){
   header,main{padding-left:16px;padding-right:16px}
   .gpus{grid-template-columns:1fr}
@@ -117,21 +140,44 @@ body.drawer-open main{padding-bottom:50vh}
 </header>
 <main>
   <div class="err" id="err" hidden></div>
+  <div id="gpuSec">
   <h2>GPU <span class="cnt" id="gcnt"></span></h2>
   <div class="gpus" id="gpus"></div>
+  </div>
   <h2>任务 <span class="cnt" id="jcnt"></span>
-    <span class="tools"><button class="btn on" id="fRecent">全部</button><button class="btn" id="fActive">运行中</button></span>
+    <span class="tools" id="tabs"><button class="btn on" data-tab="recent">最近</button><button class="btn" data-tab="active">运行中</button><button class="btn" data-tab="all">全部</button><button class="btn" data-tab="archived">已归档</button></span>
   </h2>
+  <div class="jbar">
+    <input type="search" id="q" placeholder="搜索 名称 / 命令 / 备注 / ID">
+    <label class="hs"><input type="checkbox" id="byGroup"> 按分组折叠</label>
+    <label class="hs"><input type="checkbox" id="hideGpu"> 隐藏 GPU (管理模式)</label>
+    <span class="spacer"></span>
+    <span class="hs" style="color:var(--faint)">勾选后批量操作 · Shift 连选 · 运行中 / 排队的任务不能删除或归档</span>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div id="bulk" hidden>
+    <b id="bCnt"></b>
+    <input id="bGroup" list="groupList" placeholder="分组名"><datalist id="groupList"></datalist>
+    <button class="btn" id="bSetGroup">设为分组</button>
+    <button class="btn" id="bPrefix" title="例如 lf5-gated → lf5, ev-g-cemhold-s1 → ev">按名称前缀分组</button>
+    <button class="btn" id="bClearGroup">清除分组</button>
+    <button class="btn" id="bArchive">归档</button>
+    <button class="btn" id="bUnarchive">取消归档</button>
+    <button class="btn danger" id="bRm">删除</button>
+    <span class="spacer"></span>
+    <button class="btn" id="bNone">取消选择</button>
+  </div>
   <div class="tw"><table>
-    <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>GPU</th><th>进度</th><th>ETA</th><th>已运行</th><th>提交</th><th>最后输出</th></tr></thead>
+    <thead><tr><th class="ck"><input type="checkbox" id="ckAll"></th><th>ID</th><th>名称</th><th>分组</th><th>状态</th><th>GPU</th><th>进度</th><th>ETA</th><th>已运行</th><th>提交</th><th>最后输出</th></tr></thead>
     <tbody id="jobs"></tbody>
   </table></div>
 </main>
 <div id="drawer">
   <div class="dh"><span class="t" id="dTitle"></span><span id="dSt"></span><span class="c" id="dCmd"></span>
-    <button class="btn" id="dFollow">自动滚动: 开</button><button class="btn" id="dClose">关闭</button></div>
+    <button class="btn" id="dFollow">自动滚动: 开</button><button class="btn" id="dSelect">选中此任务</button><button class="btn" id="dClose">关闭</button></div>
   <pre id="log"></pre>
 </div>
+<div id="toast" hidden></div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const api = p => 'api/' + p + (TOKEN ? (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : '');
@@ -139,7 +185,9 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ACTIVE = ['running', 'queued'];
 const ST = {running:'运行中', queued:'排队', done:'完成', failed:'失败', killed:'已终止', cancelled:'已取消', lost:'丢失'};
-let state = null, sel = null, onlyActive = false, follow = true, lastOk = 0, logTimer = null;
+let state = null, sel = null, follow = true, lastOk = 0, logTimer = null;
+let jobs = [], jnow = 0, tab = 'recent', gfilter = null, checked = new Set(), lastCk = null, collapsed = new Set(), visibleIds = [];
+const LS = (k, v) => { try { if (v === undefined) return JSON.parse(localStorage.getItem('jb.' + k)); localStorage.setItem('jb.' + k, JSON.stringify(v)); } catch (e) { return null; } };
 
 function dur(s) {
   if (s == null) return '-';
@@ -202,43 +250,138 @@ function renderGpus(gpus, cfg, now) {
   }).join('');
 }
 
-function renderJobs(jobs, now) {
+const UNGROUPED = '\u0000';
+const gkey = j => j.group || UNGROUPED;
+const gname = k => k === UNGROUPED ? '未分组' : k;
+
+function tabRows() {
+  let rows = jobs;
+  if (tab === 'archived') rows = rows.filter(j => j.archived);
+  else rows = rows.filter(j => !j.archived);
+  if (tab === 'active') rows = rows.filter(j => ACTIVE.includes(j.status));
+  if (tab === 'recent') {
+    const act = rows.filter(j => ACTIVE.includes(j.status)), fin = rows.filter(j => !ACTIVE.includes(j.status)).slice(0, 30);
+    rows = rows.filter(j => act.includes(j) || fin.includes(j));
+  }
+  return rows;
+}
+
+function renderChips(rows) {
+  const cnt = new Map();
+  rows.forEach(j => cnt.set(gkey(j), (cnt.get(gkey(j)) || 0) + 1));
+  if (gfilter != null && !cnt.has(gfilter)) cnt.set(gfilter, 0);
+  const keys = [...cnt.keys()].sort((a, b) => a === UNGROUPED ? 1 : b === UNGROUPED ? -1 : a.localeCompare(b));
+  $('chips').innerHTML = (keys.length > 1 || gfilter != null || keys[0] !== UNGROUPED)
+    ? `<span class="chip ${gfilter == null ? 'on' : ''}" data-g="">全部分组<span class="k">${rows.length}</span></span>` +
+      keys.map(k => `<span class="chip ${gfilter === k ? 'on' : ''}" data-g="${esc(k)}">${esc(gname(k))}<span class="k">${cnt.get(k)}</span></span>`).join('')
+    : '';
+  const all = [...new Set(jobs.map(j => j.group).filter(Boolean))].sort();
+  $('groupList').innerHTML = all.map(g => `<option value="${esc(g)}">`).join('');
+}
+
+function jobRow(j, now) {
+  const pct = j.total ? Math.min(100, 100 * j.done / j.total) : null;
+  const prog = j.done == null ? '<span class="none">-</span>'
+    : `<div class="pg">${pct == null ? '' : `<div class="pgb ${j.status === 'running' ? 'run' : ''}"><i style="width:${pct}%"></i></div>`}
+       <span class="n">${num(j.done)}${j.total ? ' / ' + num(j.total) : ''}</span>${pct == null ? '' : `<span class="pct n">${pct.toFixed(0)}%</span>`}</div>`;
+  const st = (ST[j.status] || j.status) + (j.status === 'failed' && j.rc != null ? ` (${j.rc})` : '');
+  return `<tr data-id="${j.id}" class="${sel === j.id ? 'sel' : ''} ${j.archived ? 'archived' : ''}">
+    <td class="ck"><input type="checkbox" data-ck="${j.id}" ${checked.has(j.id) ? 'checked' : ''}></td>
+    <td class="jid">${j.id}</td><td class="jname">${esc(j.name)}${j.archived ? '<span class="arch">归档</span>' : ''}</td>
+    <td>${j.group ? `<span class="gtag" data-g="${esc(j.group)}">${esc(j.group)}</span>` : '<span class="none">-</span>'}</td>
+    <td><span class="st st-${j.status}">${st}</span></td><td class="n">${esc(j.gpu)}</td>
+    <td>${prog}</td><td class="n">${dur(j.eta)}</td><td class="n">${dur(j.elapsed)}</td>
+    <td title="${tstr(j.submitted)} (服务器时钟)">${ago(now - j.submitted)}</td><td class="last" title="${esc(j.last_line)}">${esc(j.last_line)}</td></tr>`;
+}
+
+function renderJobs() {
+  const now = jnow;
   const running = jobs.filter(j => j.status === 'running').length, queued = jobs.filter(j => j.status === 'queued').length;
-  $('jcnt').textContent = `${running} 运行中` + (queued ? ` · ${queued} 排队` : '');
-  const rows = onlyActive ? jobs.filter(j => ACTIVE.includes(j.status)) : jobs;
-  if (!rows.length) { $('jobs').innerHTML = `<tr><td colspan="9" class="empty">没有任务 · jb submit -- CMD</td></tr>`; return; }
-  $('jobs').innerHTML = rows.map(j => {
-    const pct = j.total ? Math.min(100, 100 * j.done / j.total) : null;
-    const prog = j.done == null ? '<span class="none">-</span>'
-      : `<div class="pg">${pct == null ? '' : `<div class="pgb ${j.status === 'running' ? 'run' : ''}"><i style="width:${pct}%"></i></div>`}
-         <span class="n">${num(j.done)}${j.total ? ' / ' + num(j.total) : ''}</span>${pct == null ? '' : `<span class="pct n">${pct.toFixed(0)}%</span>`}</div>`;
-    const st = (ST[j.status] || j.status) + (j.status === 'failed' && j.rc != null ? ` (${j.rc})` : '');
-    return `<tr data-id="${j.id}" class="${sel === j.id ? 'sel' : ''}">
-      <td class="jid">${j.id}</td><td class="jname">${esc(j.name)}</td>
-      <td><span class="st st-${j.status}">${st}</span></td><td class="n">${esc(j.gpu)}</td>
-      <td>${prog}</td><td class="n">${dur(j.eta)}</td><td class="n">${dur(j.elapsed)}</td>
-      <td title="${tstr(j.submitted)} (服务器时钟)">${ago(now - j.submitted)}</td><td class="last" title="${esc(j.last_line)}">${esc(j.last_line)}</td></tr>`;
-  }).join('');
+  const narch = jobs.filter(j => j.archived).length;
+  $('jcnt').textContent = `${running} 运行中` + (queued ? ` · ${queued} 排队` : '') + ` · 共 ${jobs.length}` + (narch ? ` (归档 ${narch})` : '');
+  let rows = tabRows();
+  const q = $('q').value.trim().toLowerCase();
+  if (q) rows = rows.filter(j => [j.id, j.name, j.cmd, j.note, j.group].some(x => String(x ?? '').toLowerCase().includes(q)));
+  renderChips(rows);
+  if (gfilter != null) rows = rows.filter(j => gkey(j) === gfilter);
+  // 勾选只保留仍存在的任务
+  const exist = new Set(jobs.map(j => j.id));
+  [...checked].forEach(id => exist.has(id) || checked.delete(id));
+  visibleIds = [];
+  let html = '';
+  if (!rows.length) html = `<tr><td colspan="11" class="empty">${jobs.length ? '没有匹配的任务' : '没有任务 · jb submit -- CMD'}</td></tr>`;
+  else if ($('byGroup').checked) {
+    const groups = new Map();
+    rows.forEach(j => { const k = gkey(j); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(j); });
+    const keys = [...groups.keys()].sort((a, b) => a === UNGROUPED ? 1 : b === UNGROUPED ? -1 : Math.max(...groups.get(b).map(j => j.id)) - Math.max(...groups.get(a).map(j => j.id)));
+    for (const k of keys) {
+      const g = groups.get(k), act = g.filter(j => ACTIVE.includes(j.status)).length, open = !collapsed.has(k);
+      const allck = g.every(j => checked.has(j.id));
+      html += `<tr class="ghead" data-gh="${esc(k)}"><td class="ck"><input type="checkbox" data-gck="${esc(k)}" ${allck ? 'checked' : ''}></td>
+        <td colspan="10">${open ? '▾' : '▸'} ${esc(gname(k))}<span class="k">${g.length} 个${act ? ` · ${act} 运行中` : ''}</span></td></tr>`;
+      if (open) { html += g.map(j => jobRow(j, now)).join(''); visibleIds.push(...g.map(j => j.id)); }
+    }
+  } else { html = rows.map(j => jobRow(j, now)).join(''); visibleIds = rows.map(j => j.id); }
+  $('jobs').innerHTML = html;
+  $('ckAll').checked = visibleIds.length > 0 && visibleIds.every(id => checked.has(id));
+  renderBulk();
+}
+
+function renderBulk() {
+  $('bulk').hidden = !checked.size;
+  const sj = jobs.filter(j => checked.has(j.id)), act = sj.filter(j => ACTIVE.includes(j.status)).length;
+  $('bCnt').textContent = `已选 ${checked.size}` + (act ? ` (含 ${act} 个运行中, 删除/归档会跳过)` : '');
+}
+
+function toast(msg) {
+  $('toast').textContent = msg; $('toast').hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => $('toast').hidden = true, 4000);
+}
+
+async function act(op, ids, extra = {}) {
+  if (!ids.length) return;
+  try {
+    const r = await fetch(api('action'), {method: 'POST', headers: {'Content-Type': 'application/json', 'X-JB': '1'},
+      body: JSON.stringify({op, ids, ...extra})});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const ok = d.results.filter(x => x.ok).length, bad = d.results.filter(x => !x.ok);
+    toast(`${ok} 个成功` + (bad.length ? `, ${bad.length} 个跳过:\n` + bad.slice(0, 6).map(x => `#${x.id} ${x.msg}`).join('\n') : ''));
+    if (op !== 'group') d.results.forEach(x => x.ok && checked.delete(x.id));  // 删除 / (取消)归档后任务移出当前视图, 不再保留勾选
+  } catch (e) { toast('操作失败: ' + e.message); }
+  await loadJobs();
+}
+
+const selIds = () => [...checked].sort((a, b) => a - b);
+const prefixOf = n => (String(n || '').match(/^[A-Za-z]+\d*/) || [String(n || '').split(/[-_]/)[0]])[0];
+
+async function loadJobs() {
+  try {
+    const r = await fetch(api('jobs'), {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    jobs = d.jobs; jnow = d.now;
+    renderJobs();
+    if (sel != null) updateDrawerHead();
+  } catch (e) { /* 连接错误由 tick 显示 */ }
 }
 
 async function tick() {
   try {
-    const r = await fetch(api('state'), {cache: 'no-store'});
+    const r = await fetch(api('state?jobs=0'), {cache: 'no-store'});
     if (!r.ok) throw new Error(r.status === 401 ? '未授权: URL 需带 ?token=...' : 'HTTP ' + r.status);
     state = await r.json();
     lastOk = Date.now();
     renderHost(state.host || {});
     renderGpus(state.gpus || [], state.cfg || {}, state.now);
-    renderJobs(state.jobs || [], state.now);
     $('err').hidden = !state.error; $('err').textContent = state.error || '';
-    if (sel != null) updateDrawerHead();
   } catch (e) {
     $('err').hidden = false; $('err').textContent = '连接失败: ' + e.message + ' (隧道是否在运行?)';
   }
 }
 
 function updateDrawerHead() {
-  const j = (state?.jobs || []).find(x => x.id === sel);
+  const j = jobs.find(x => x.id === sel);
   if (!j) return;
   $('dTitle').textContent = `#${j.id} ${j.name}`;
   $('dSt').innerHTML = `<span class="st st-${j.status}">${ST[j.status] || j.status}</span>`;
@@ -265,32 +408,86 @@ function openJob(id) {
   $('log').dataset.first = '1'; $('log').textContent = '加载中…';
   $('drawer').classList.add('open'); document.body.classList.add('drawer-open');
   updateDrawerHead(); loadLog();
-  if (state) renderJobs(state.jobs || [], state.now);
+  renderJobs();
 }
 function closeDrawer() {
   sel = null; clearTimeout(logTimer);
   $('drawer').classList.remove('open'); document.body.classList.remove('drawer-open');
-  if (state) renderJobs(state.jobs || [], state.now);
+  renderJobs();
 }
-function setFilter(active) {
-  onlyActive = active;
-  $('fActive').classList.toggle('on', active); $('fRecent').classList.toggle('on', !active);
-  if (state) renderJobs(state.jobs || [], state.now);
+function setTab(t) {
+  tab = t; LS('tab', t);
+  document.querySelectorAll('#tabs .btn').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
+  renderJobs();
 }
+function setGroupFilter(g) { gfilter = g; renderJobs(); }
 
-$('jobs').addEventListener('click', e => { const tr = e.target.closest('tr[data-id]'); if (tr) openJob(+tr.dataset.id); });
+$('jobs').addEventListener('click', e => {
+  const ck = e.target.closest('input[data-ck]');
+  if (ck) {
+    const id = +ck.dataset.ck;
+    if (e.shiftKey && lastCk != null) {
+      const a = visibleIds.indexOf(lastCk), b = visibleIds.indexOf(id);
+      if (a >= 0 && b >= 0) visibleIds.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(x => ck.checked ? checked.add(x) : checked.delete(x));
+    }
+    ck.checked ? checked.add(id) : checked.delete(id);
+    lastCk = id; renderJobs(); return;
+  }
+  const gck = e.target.closest('input[data-gck]');
+  if (gck) {
+    jobs.filter(j => gkey(j) === gck.dataset.gck && tabRows().includes(j)).forEach(j => gck.checked ? checked.add(j.id) : checked.delete(j.id));
+    renderJobs(); return;
+  }
+  if (e.target.closest('td.ck')) return;
+  const gh = e.target.closest('tr[data-gh]');
+  if (gh) { const k = gh.dataset.gh; collapsed.has(k) ? collapsed.delete(k) : collapsed.add(k); renderJobs(); return; }
+  const gt = e.target.closest('.gtag');
+  if (gt) { setGroupFilter(gt.dataset.g); return; }
+  const tr = e.target.closest('tr[data-id]'); if (tr) openJob(+tr.dataset.id);
+});
+$('ckAll').onchange = e => { visibleIds.forEach(id => e.target.checked ? checked.add(id) : checked.delete(id)); renderJobs(); };
+$('chips').addEventListener('click', e => { const c = e.target.closest('.chip'); if (c) setGroupFilter(c.dataset.g === '' ? null : c.dataset.g); });
+$('tabs').addEventListener('click', e => { const b = e.target.closest('[data-tab]'); if (b) setTab(b.dataset.tab); });
+$('q').oninput = () => renderJobs();
+$('byGroup').onchange = e => { LS('byGroup', e.target.checked); renderJobs(); };
+$('hideGpu').onchange = e => { LS('hideGpu', e.target.checked); document.body.classList.toggle('hide-gpu', e.target.checked); };
+$('bNone').onclick = () => { checked.clear(); renderJobs(); };
+$('bSetGroup').onclick = () => {
+  const g = $('bGroup').value.trim();
+  if (!g) { $('bGroup').focus(); return toast('先填分组名'); }
+  act('group', selIds(), {group: g});
+};
+$('bClearGroup').onclick = () => act('group', selIds(), {group: ''});
+$('bPrefix').onclick = async () => {
+  const by = new Map();
+  jobs.filter(j => checked.has(j.id)).forEach(j => { const p = prefixOf(j.name); if (!by.has(p)) by.set(p, []); by.get(p).push(j.id); });
+  if (!confirm('将按前缀设置分组:\n' + [...by].map(([p, ids]) => `${p}: ${ids.length} 个`).join('\n'))) return;
+  for (const [p, ids] of by) await act('group', ids, {group: p});
+};
+$('bArchive').onclick = () => act('archive', selIds());
+$('bUnarchive').onclick = () => act('unarchive', selIds());
+$('bRm').onclick = () => {
+  const sj = jobs.filter(j => checked.has(j.id) && !ACTIVE.includes(j.status));
+  if (!sj.length) return toast('选中的都是运行中 / 排队任务, 不能删除');
+  const names = sj.slice(0, 15).map(j => `#${j.id} ${j.name}`).join('\n') + (sj.length > 15 ? `\n... 共 ${sj.length} 个` : '');
+  if (confirm(`永久删除 ${sj.length} 个任务的记录和日志 (~/.jb/jobs/ID), 不可恢复:\n\n${names}`)) act('rm', sj.map(j => j.id));
+};
+$('dSelect').onclick = () => { if (sel != null) { checked.add(sel); renderJobs(); } };
 $('gpus').addEventListener('click', e => { const t = e.target.closest('[data-job]'); if (t) openJob(+t.dataset.job); });
 $('dClose').onclick = closeDrawer;
 $('dFollow').onclick = () => { follow = !follow; $('dFollow').textContent = '自动滚动: ' + (follow ? '开' : '关'); };
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-$('fRecent').onclick = () => setFilter(false);
-$('fActive').onclick = () => setFilter(true);
+
+if (LS('byGroup')) $('byGroup').checked = true;
+if (LS('hideGpu')) { $('hideGpu').checked = true; document.body.classList.add('hide-gpu'); }
+setTab(LS('tab') || 'recent');
 
 setInterval(() => {
   $('clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12: false});
   $('dot').classList.toggle('stale', Date.now() - lastOk > 6000);
 }, 1000);
 tick(); setInterval(tick, 2000);
+loadJobs(); setInterval(loadJobs, 3000);
 </script>
 </body>
 </html>

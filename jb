@@ -11,7 +11,12 @@
   jb gpu                   GPU 占用 + 对应任务
   jb notify set serverchan KEY   任务结束推送到微信 (还支持 pushplus/qmsg/bark/ntfy/webhook)
   jb serve -d              后台启动网页 dashboard (默认 127.0.0.1:18765)
+  jb group NAME ID ...     给任务设分组 (NAME 为 - 时清除); jb groups 列出分组
+  jb archive ID ...        归档 (jb ls / 面板默认隐藏); jb unarchive 取消
   jb rm ID ... / jb clean  删除任务记录
+
+  ID 可写成 201 / 201-207 / 201,203; archive/unarchive/group/rm 还可用
+  -G 分组 / --match 名称正则 / --status done,failed 批量选择 (只作用于已结束的任务).
 
 进度识别 (优先级从高到低):
   1. 脚本打印 "[jb] progress 123/1000"
@@ -105,6 +110,40 @@ def meta(jid):
 
 def progress(jid):
     return read_json(os.path.join(jdir(jid), "progress.json"), {})
+
+
+def label(jid):
+    """分组 / 归档等标注, 单独存在 label.json, 不碰 runner 读写的 meta.json."""
+    return read_json(os.path.join(jdir(jid), "label.json"), {}) or {}
+
+
+def set_label(jid, **kw):
+    path = os.path.join(jdir(jid), "label.json")
+    lb = read_json(path, {}) or {}
+    for k, v in kw.items():
+        if v in (None, "", False):
+            lb.pop(k, None)
+        else:
+            lb[k] = v
+    write_json(path, lb)
+
+
+def parse_ids(tokens):
+    ids = []
+    for tok in tokens or []:
+        for part in str(tok).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            mt = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+            if mt:
+                lo, hi = sorted((int(mt[1]), int(mt[2])))
+                ids += range(lo, hi + 1)
+            elif part.isdigit():
+                ids.append(int(part))
+            else:
+                sys.exit(f"jb: 无法解析任务 ID {part!r}")
+    return ids
 
 
 def pid_alive(pid, must_contain=None):
@@ -565,12 +604,15 @@ def do_submit(spec, check=True):
     spec.setdefault("log", os.path.join(d, "out.log"))
     spec["name"] = spec.get("name") or guess_name(spec["cmd"])
     spec["git"] = git_rev(spec["cwd"])
+    group = spec.pop("group", None)
     write_json(os.path.join(d, "meta.json"), spec)
+    if group:
+        set_label(jid, group=group)
     with open(os.path.join(d, "runner.log"), "ab") as rl:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_run", str(jid)],
                              stdin=subprocess.DEVNULL, stdout=rl, stderr=subprocess.STDOUT,
                              start_new_session=True, cwd=spec["cwd"])
-    gpu = gpu_label(spec)
+    gpu = gpu_label(spec) + (f" group={group}" if group else "")
     after = f" after={','.join(map(str, spec['after']))}" if spec.get("after") else ""
     print(f"job {jid} ({spec['name']}) 已提交  gpu={gpu}{after}")
     print(f"  log: {spec['log']}")
@@ -603,6 +645,7 @@ def cmd_submit(a):
         "after": [int(x) for x in a.after.split(",")] if a.after else [],
         "after_any": a.after_any,
         "notify": True if a.notify else False if a.no_notify else None,
+        "group": a.group,
     }
     if a.log:
         spec["log"] = os.path.abspath(os.path.join(cwd, a.log))
@@ -615,12 +658,14 @@ def job_row(jid):
         return None
     st = status(m)
     p = progress(jid)
+    lb = label(jid)
     return {
         "id": jid, "name": m.get("name"), "status": st,
         "gpu": gpu_label(m),
         "elapsed": elapsed(m), "done": p.get("done"), "total": p.get("total"),
         "eta": eta_now(m, st, p), "rc": m.get("rc"), "submitted": m.get("submitted"),
         "last_line": p.get("last_line", ""), "cmd": m.get("cmd"), "note": m.get("note"),
+        "group": lb.get("group"), "archived": bool(lb.get("archived")),
         "_p": p,
     }
 
@@ -628,7 +673,13 @@ def job_row(jid):
 def cmd_ls(a):
     ids = all_ids()
     rows = [r for r in (job_row(j) for j in ids) if r]
-    if not a.all:
+    if a.group:
+        rows = [r for r in rows if (r["group"] or "") == ("" if a.group == "-" else a.group)]
+    if a.archived:
+        rows = [r for r in rows if r["archived"]]
+    elif not a.with_archived:
+        rows = [r for r in rows if not r["archived"]]
+    if not (a.all or a.group or a.archived):
         active = [r for r in rows if r["status"] in ACTIVE]
         others = [r for r in rows if r["status"] not in ACTIVE][-a.n:] if a.n else []
         rows = sorted(active + others, key=lambda r: r["id"])
@@ -638,12 +689,13 @@ def cmd_ls(a):
     if not rows:
         print("(没有任务)")
         return
-    head = ["ID", "NAME", "STATUS", "GPU", "ELAPSED", "PROGRESS", "ETA", "SUBMITTED"]
+    head = ["ID", "NAME", "STATUS", "GPU", "ELAPSED", "PROGRESS", "ETA", "SUBMITTED", "GROUP"]
     table = []
     for r in rows:
         st = r["status"] + (f"({r['rc']})" if r["status"] == "failed" else "")
         table.append([str(r["id"]), (r["name"] or "")[:24], st, r["gpu"], fmt_dur(r["elapsed"]),
-                      prog_str(r["_p"]), fmt_dur(r["eta"]), fmt_time(r["submitted"])])
+                      prog_str(r["_p"]), fmt_dur(r["eta"]), fmt_time(r["submitted"]),
+                      ((r["group"] or "") + (" [A]" if r["archived"] else "")).strip()])
     widths = [max(len(x) for x in col) for col in zip(head, *table)]
     print("  ".join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
     for r, row in zip(rows, table):
@@ -764,6 +816,7 @@ def cmd_retry(a):
     m = meta(a.id)
     spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify")}
     spec["after"], spec["after_any"] = [], False
+    spec["group"] = label(a.id).get("group")
     if a.gpu is not None:
         spec["env"] = gpu_env(parse_gpus(a.gpu, a.force))
     if m["log"] != os.path.join(jdir(a.id), "out.log"):
@@ -792,14 +845,110 @@ def cmd_gpu(a):
         print(f"GPU {idx}{tag:6}  util {util:>3}%  mem {int(used):>5}/{total} MiB  jobs: {', '.join(users.get(idx, [])) or '-'}")
 
 
+# 管理操作: 只改 label.json 或删除已结束任务的目录, 从不触碰运行中 / 排队中的任务.
+
+def op_rm(jid):
+    m = read_json(os.path.join(jdir(jid), "meta.json"))
+    if m is None:
+        return False, "不存在"
+    if status(m) in ACTIVE:
+        return False, "仍在运行/排队, 跳过 (先 jb kill)"
+    shutil.rmtree(jdir(jid))
+    return True, "已删除"
+
+
+def op_archive(jid, on=True):
+    m = read_json(os.path.join(jdir(jid), "meta.json"))
+    if m is None:
+        return False, "不存在"
+    if on and status(m) in ACTIVE:
+        return False, "仍在运行/排队, 不能归档"
+    set_label(jid, archived=on, archived_at=time.time() if on else None)
+    return True, "已归档" if on else "已取消归档"
+
+
+def op_group(jid, group):
+    if not os.path.exists(os.path.join(jdir(jid), "meta.json")):
+        return False, "不存在"
+    group = (group or "").strip()
+    set_label(jid, group=group or None)
+    return True, f"分组 = {group}" if group else "已清除分组"
+
+
+def select_jobs(a):
+    """显式 ID + (-G / --match / --status) 选择器; 返回 (ids, 是否用了选择器)."""
+    ids = set(parse_ids(a.ids))
+    use_sel = bool(a.sel_group or a.match or a.status)
+    if use_sel:
+        pat = re.compile(a.match) if a.match else None
+        sts = set(a.status.split(",")) if a.status else None
+        for jid in all_ids():
+            m = read_json(os.path.join(jdir(jid), "meta.json"))
+            if not m:
+                continue
+            st = status(m)
+            if st in ACTIVE:
+                continue
+            if a.sel_group and (label(jid).get("group") or "") != ("" if a.sel_group == "-" else a.sel_group):
+                continue
+            if pat and not pat.search(m.get("name") or ""):
+                continue
+            if sts and st not in sts:
+                continue
+            ids.add(jid)
+    if not ids:
+        sys.exit("jb: 没有选中任何任务")
+    return sorted(ids), use_sel
+
+
+def confirm(ids, verb, yes):
+    if yes:
+        return True
+    names = []
+    for jid in ids:
+        m = read_json(os.path.join(jdir(jid), "meta.json")) or {}
+        names.append(f"{jid}:{m.get('name')}")
+    print(f"将{verb} {len(ids)} 个任务: " + ", ".join(names[:40]) + (" ..." if len(names) > 40 else ""))
+    if not sys.stdin.isatty():
+        print("非交互环境, 加 -y 确认")
+        return False
+    return input("确认? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def run_op(ids, fn, *args):
+    for jid in ids:
+        ok, msg = fn(jid, *args)
+        print(f"job {jid} {msg}")
+
+
 def cmd_rm(a):
-    for jid in a.ids:
-        m = meta(jid)
-        if status(m) in ACTIVE:
-            print(f"job {jid} 仍在运行, 跳过 (先 jb kill)")
+    ids, use_sel = select_jobs(a)
+    if use_sel and not confirm(ids, "删除", a.yes):
+        return
+    run_op(ids, op_rm)
+
+
+def cmd_archive(a):
+    ids, use_sel = select_jobs(a)
+    run_op(ids, op_archive, a.sub != "unarchive")
+
+
+def cmd_group(a):
+    ids, _ = select_jobs(a)
+    run_op(ids, op_group, "" if a.name == "-" else a.name)
+
+
+def cmd_groups(a):
+    cnt = {}
+    for jid in all_ids():
+        if not os.path.exists(os.path.join(jdir(jid), "meta.json")):
             continue
-        shutil.rmtree(jdir(jid))
-        print(f"job {jid} 已删除")
+        lb = label(jid)
+        c = cnt.setdefault(lb.get("group") or "(未分组)", [0, 0])
+        c[0] += 1
+        c[1] += bool(lb.get("archived"))
+    for g, (n, na) in sorted(cnt.items()):
+        print(f"{g:24} {n:4} 个" + (f"  (归档 {na})" if na else ""))
 
 
 def cmd_clean(a):
@@ -944,9 +1093,12 @@ class Sampler(threading.Thread):
 
 
 def jobs_state(n_finished=30):
+    """n_finished=None 返回全部任务 (含归档). 默认值保持旧行为 (jbmac 靠它判断任务结束)."""
     rows = [r for r in (job_row(j) for j in all_ids()) if r]
-    active = [r for r in rows if r["status"] in ACTIVE]
-    rows = sorted(active + [r for r in rows if r["status"] not in ACTIVE][-n_finished:], key=lambda r: -r["id"])
+    if n_finished is not None:
+        active = [r for r in rows if r["status"] in ACTIVE]
+        rows = active + [r for r in rows if r["status"] not in ACTIVE][-n_finished:]
+    rows = sorted(rows, key=lambda r: -r["id"])
     out = []
     for r in rows:
         p = r.pop("_p")
@@ -979,20 +1131,62 @@ def make_handler(sampler, token):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self):
-            u = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(u.query)
+        def _auth(self, qs):
             if token:
                 given = qs.get("token", [""])[0] or self.headers.get("X-Token", "")
                 if not hmac.compare_digest(given, token):
-                    return self._send(401, "unauthorized: append ?token=...", "text/plain; charset=utf-8")
+                    self._send(401, "unauthorized: append ?token=...", "text/plain; charset=utf-8")
+                    return False
+            return True
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            if not self._auth(qs):
+                return
+            # 防 CSRF / DNS rebinding: 必须带自定义头 (跨站请求会触发 CORS 预检而被拒), Host / Origin 必须是本机
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            origin = self.headers.get("Origin")
+            if (self.headers.get("X-JB") != "1" or (not token and host not in ("127.0.0.1", "localhost", "::1"))
+                    or (origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host"))):
+                return self._send(403, '{"error":"forbidden"}')
+            if not u.path.rstrip("/").endswith("/api/action"):
+                return self._send(404, '{"error":"not found"}')
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1 << 20)) or b"{}")
+                op, ids = body["op"], [int(x) for x in body["ids"]]
+            except (KeyError, ValueError, TypeError):
+                return self._send(400, '{"error":"bad request"}')
+            fns = {"rm": (op_rm,), "archive": (op_archive, True), "unarchive": (op_archive, False),
+                   "group": (op_group, str(body.get("group") or "")[:64])}
+            if op not in fns:
+                return self._send(400, '{"error":"bad op"}')
+            fn, *args = fns[op]
+            res = []
+            for jid in ids:
+                try:
+                    ok, msg = fn(jid, *args)
+                except Exception as e:  # noqa: BLE001
+                    ok, msg = False, str(e)
+                res.append({"id": jid, "ok": ok, "msg": msg})
+            return self._send(200, json.dumps({"results": res}, ensure_ascii=False))
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            if not self._auth(qs):
+                return
             path = u.path.rstrip("/").rsplit("/api/", 1)
             if len(path) == 1:
                 return self._send(200, dashboard_html(), "text/html; charset=utf-8")
             if path[1] == "state":
                 s = sampler.snapshot()
-                s.update(jobs=jobs_state(), cfg=load_cfg(), now=time.time())
+                s.update(cfg=load_cfg(), now=time.time())
+                if qs.get("jobs", ["1"])[0] != "0":
+                    s["jobs"] = jobs_state()
                 return self._send(200, json.dumps(s, ensure_ascii=False))
+            if path[1] == "jobs":
+                return self._send(200, json.dumps({"jobs": jobs_state(None), "now": time.time()}, ensure_ascii=False))
             if path[1] == "log":
                 try:
                     jid = int(qs["id"][0])
@@ -1073,6 +1267,7 @@ def main():
     s.add_argument("--no-check", action="store_true", help="不检查任务是否立即崩溃")
     s.add_argument("--notify", action="store_true", help="结束时一定推送 (忽略 min_seconds)")
     s.add_argument("--no-notify", action="store_true", help="结束时不推送")
+    s.add_argument("-G", "--group", help="分组名")
     s.add_argument("cmd", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_submit)
 
@@ -1080,6 +1275,9 @@ def main():
     s.add_argument("-a", "--all", action="store_true", help="显示全部历史任务")
     s.add_argument("-n", type=int, default=8, help="额外显示最近 N 个已结束任务 (默认 8)")
     s.add_argument("-v", "--verbose", action="store_true", help="显示每个任务日志最后一行")
+    s.add_argument("-G", "--group", help="只看该分组 (- 表示未分组), 含全部历史")
+    s.add_argument("--archived", action="store_true", help="只看已归档")
+    s.add_argument("-A", "--with-archived", action="store_true", help="同时显示已归档")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_ls)
 
@@ -1133,9 +1331,29 @@ def main():
     s.add_argument("value", nargs="?")
     s.set_defaults(fn=cmd_notify)
 
+    def selector(s):
+        s.add_argument("ids", nargs="*", help="ID / 201-207 / 201,203")
+        s.add_argument("-G", "--group", dest="sel_group", help="选中该分组的已结束任务 (- = 未分组)")
+        s.add_argument("--match", help="选中名称匹配该正则的已结束任务")
+        s.add_argument("--status", help="选中这些状态的已结束任务, 如 done,failed,killed")
+
     s = sub.add_parser("rm", help="删除任务记录 (含默认位置的日志)")
-    s.add_argument("ids", type=int, nargs="+")
+    selector(s)
+    s.add_argument("-y", "--yes", action="store_true", help="用选择器时不再确认")
     s.set_defaults(fn=cmd_rm)
+
+    for nm, hp in (("archive", "归档 (默认隐藏)"), ("unarchive", "取消归档")):
+        s = sub.add_parser(nm, help=hp)
+        selector(s)
+        s.set_defaults(fn=cmd_archive)
+
+    s = sub.add_parser("group", help="设置分组: jb group NAME ID ... (NAME 为 - 清除)")
+    s.add_argument("name")
+    selector(s)
+    s.set_defaults(fn=cmd_group)
+
+    s = sub.add_parser("groups", help="列出分组")
+    s.set_defaults(fn=cmd_groups)
 
     s = sub.add_parser("clean", help="删除 N 天前结束的任务")
     s.add_argument("--days", type=float, default=14)
