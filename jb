@@ -9,6 +9,9 @@
   jb kill ID ...           终止任务
   jb retry ID              用相同参数重新提交
   jb gpu                   GPU 占用 + 对应任务
+  jb submit -g auto ...    交给调度器选 GPU (需 jb sched -d 在跑): 白天最多占 sched.limit 张卡,
+                           夜间窗口 (sched.night) 借用没有其他用户的空卡; 可抢占的任务被抢占时回到队列, 重跑同一命令续训
+  jb sched -d / --stop / --status / --once [--dry]   调度器守护进程 (配置 ~/.jb/config.json 的 "sched")
   jb notify set serverchan KEY   任务结束推送到微信 (还支持 pushplus/qmsg/bark/ntfy/webhook)
   jb serve -d              后台启动网页 dashboard (默认 127.0.0.1:18765)
   jb group NAME ID ...     给任务设分组 (NAME 为 - 时清除); jb groups 列出分组
@@ -25,6 +28,7 @@
   4. tqdm 进度条
 """
 import argparse
+import getpass
 import fcntl
 import hmac
 import json
@@ -169,6 +173,8 @@ def status(m):
             return "cancelled"
         return "done" if m["rc"] == 0 else "failed"
     if pid_alive(m.get("runner_pid"), str(m["id"])):
+        if m.get("sched") and not m.get("child_pid"):
+            return "queued"  # 调度任务: 等调度器分配 GPU(首次或被抢占后)
         return "running" if "start" in m else "queued"
     return "lost"
 
@@ -525,6 +531,8 @@ def run_job(jid):
     env["PYTHONUNBUFFERED"] = "1"
     env["JB_JOB_ID"] = str(jid)
     os.makedirs(os.path.dirname(m["log"]) or ".", exist_ok=True)
+    if m.get("sched"):
+        return run_sched_job(jid, m, env, finish, killed_flag)
     with open(m["log"], "ab") as log:
         p = subprocess.Popen(["bash", "-c", m["cmd"]], cwd=m["cwd"], env=env, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -542,6 +550,231 @@ def run_job(jid):
     tracker.update()
     finish(p.returncode)
     maybe_notify(jid)
+
+
+def group_pids(pgid):
+    """进程组 pgid 里还活着的进程 (跑完的命令可能留下仍在收尾的子进程, 如训练进程在存断点)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                rest = f.read().rsplit(")", 1)[1].split()
+            if int(rest[2]) == pgid and rest[0] != "Z":
+                out.append(int(d))
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError, PermissionError):
+            pass
+    return out
+
+
+def run_sched_job(jid, m, env, finish, killed_flag):
+    """调度任务 (submit -g auto): 等调度器写 assign.json -> 在那张卡上跑 -> 被抢占 (preempt 标记) 则整组进程退出后回到队列, 否则结束.
+    抢占时调度器给进程组发 SIGTERM; 命令应能用同一命令续跑 (如训练脚本收到 SIGTERM 存断点后退出)."""
+    d = jdir(jid)
+    mpath = os.path.join(d, "meta.json")
+    assign_p, preempt_p = os.path.join(d, "assign.json"), os.path.join(d, "preempt")
+    kill_after = float(sched_cfg()["kill_timeout"])
+    while True:
+        m = read_json(mpath)
+        m.pop("child_pid", None)
+        m["waiting_since"] = time.time()
+        write_json(mpath, m)
+        while not os.path.exists(assign_p):
+            if os.path.exists(killed_flag):
+                return finish(None)
+            time.sleep(2)
+        a = read_json(assign_p, {}) or {}
+        gpu = str(a.get("gpu"))
+        n_pre = m.get("preempted", 0)
+        with open(m["log"], "ab") as log:
+            log.write(f"\n[jb] {time.strftime('%m-%d %H:%M:%S')} 调度到 GPU {gpu}"
+                      f"{f' (被抢占 {n_pre} 次后续跑)' if n_pre else ''}\n".encode())
+            log.flush()
+            p = subprocess.Popen(["bash", "-c", m["cmd"]], cwd=m["cwd"], env=dict(env, CUDA_VISIBLE_DEVICES=gpu),
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        m = read_json(mpath)
+        m.setdefault("start", time.time())
+        m.update(child_pid=p.pid, run_start=time.time(), env=dict(m.get("env", {}), CUDA_VISIBLE_DEVICES=gpu))
+        m.pop("waiting_since", None)
+        write_json(mpath, m)
+        tracker = Tracker(jid, m)
+        tick = 0
+        while p.poll() is None:
+            if tick % 5 == 0:
+                tracker.update()
+            tick += 1
+            time.sleep(1)
+        # bash 退出后等整个进程组退出 (训练进程可能还在存断点), 抢占后超过 kill_timeout 秒还没退就 SIGKILL
+        while group_pids(p.pid):
+            pre = read_json(preempt_p, {}) or {}
+            if pre and time.time() - pre.get("t", time.time()) > kill_after:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(2)
+        tracker.update()
+        preempted = os.path.exists(preempt_p) and not os.path.exists(killed_flag)
+        pre = read_json(preempt_p, {}) or {}
+        for f in (assign_p, preempt_p):
+            if os.path.exists(f):
+                os.remove(f)
+        if preempted:
+            m = read_json(mpath)
+            m["preempted"] = m.get("preempted", 0) + 1
+            m.get("env", {}).pop("CUDA_VISIBLE_DEVICES", None)
+            write_json(mpath, m)
+            with open(m["log"], "ab") as log:
+                log.write(f"\n[jb] {time.strftime('%m-%d %H:%M:%S')} 被调度器抢占 ({pre.get('reason', '')}), rc={p.returncode}, 回到队列\n".encode())
+            continue
+        finish(p.returncode)
+        maybe_notify(jid)
+        return
+
+
+# ---------------------------------------------------------------- scheduler
+
+SCHED_DEFAULT = {"limit": 4, "night": "01:30-08:30", "gpus": None, "interval": 20, "free_mem_mb": 2000, "kill_timeout": 900}
+
+
+def sched_cfg():
+    c = dict(SCHED_DEFAULT)
+    c.update(load_cfg().get("sched") or {})
+    return c
+
+
+def in_window(spec, now=None):
+    """spec "01:30-08:30" (本机时区), 可跨零点; 空 = 没有夜间窗口."""
+    if not spec:
+        return False
+    t = time.localtime(now)
+    cur = t.tm_hour * 60 + t.tm_min
+    lo, hi = [int(x.split(":")[0]) * 60 + int(x.split(":")[1]) for x in spec.split("-")]
+    return lo <= cur < hi if lo <= hi else cur >= lo or cur < hi
+
+
+def sched_log(msg):
+    line = f"{time.strftime('%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    with open(os.path.join(HOME, "sched.log"), "a") as f:
+        f.write(line + "\n")
+
+
+def sched_tick(dry=False, verbose=False):
+    """一轮调度. 规则:
+      - 我的卡 = 有我 (任何进程, 不只是 jb) 的 GPU 进程的卡 + 已分配给调度任务的卡
+      - 白天: 我的卡数 <= limit; 超出时抢占可抢占的调度任务 (先抢有其他用户的卡, 再抢最晚开始的)
+      - 夜间窗口: 可以用所有没有其他用户进程的卡; 我的卡数超过 limit 时, 被其他用户用上的那张卡上的调度任务让出来
+      - 空卡 (没有我的进程、没有其他用户的进程、显存占用 < free_mem_mb) 按任务 ID 顺序分给等卡的调度任务, 一卡一个任务"""
+    c = sched_cfg()
+    me = getpass.getuser()
+    allowed = c["gpus"] or load_cfg().get("allowed_gpus")
+    gpus = query_gpus({})
+    if allowed:
+        keep = set(str(allowed).split(","))
+        gpus = [g for g in gpus if g["index"] in keep]
+    others = {g["index"]: sorted({q["user"] for q in g["procs"] if q["user"] not in (me, "?")}) for g in gpus}
+    mine = {g["index"] for g in gpus if any(q["user"] == me for q in g["procs"])}
+    used_mem = {g["index"]: g["mem_used"] or 0 for g in gpus}
+    jobs = []
+    for jid in all_ids():
+        m = read_json(os.path.join(jdir(jid), "meta.json"))
+        if m and m.get("sched") and status(m) in ACTIVE:
+            jobs.append(m)
+    assigned, preempting, waiting = {}, set(), []
+    for m in jobs:
+        d = jdir(m["id"])
+        a = read_json(os.path.join(d, "assign.json"))
+        if a:
+            assigned[str(a["gpu"])] = m
+            mine.add(str(a["gpu"]))
+            if os.path.exists(os.path.join(d, "preempt")):
+                preempting.add(str(a["gpu"]))
+        elif m.get("waiting_since") and not os.path.exists(os.path.join(d, "killed")):
+            waiting.append(m)
+    night = in_window(c["night"])
+    limit = len(gpus) if night else int(c["limit"])
+    eff = mine - preempting  # 抢占中的卡等进程退出后才算空出来
+
+    def preempt(g, why):
+        m = assigned[g]
+        sched_log(f"抢占 job {m['id']} ({m.get('name')}) @ GPU {g}: {why}" + (" [dry]" if dry else ""))
+        if dry:
+            return
+        write_json(os.path.join(jdir(m["id"]), "preempt"), {"t": time.time(), "reason": why})
+        try:
+            os.killpg(m["child_pid"], signal.SIGTERM)
+        except (ProcessLookupError, KeyError, TypeError):
+            pass
+        eff.discard(g)
+
+    cand = [g for g, m in assigned.items() if g not in preempting and m.get("child_pid") and m.get("preempt", True)]
+    # 夜间借来的卡 (超过 limit 的部分) 被其他用户用上 -> 让出
+    if len(eff) > int(c["limit"]):
+        for g in sorted(cand, key=lambda g: -assigned[g].get("run_start", 0)):
+            if len(eff) <= int(c["limit"]):
+                break
+            if others.get(g):
+                preempt(g, f"其他用户 {','.join(others[g])} 开始用这张卡")
+    # 白天超出 limit -> 抢占, 先抢有其他用户的卡, 再抢最晚开始的
+    if not night and len(eff) > limit:
+        for g in sorted((g for g in cand if g in eff), key=lambda g: (not others.get(g), -assigned[g].get("run_start", 0))):
+            if len(eff) <= limit:
+                break
+            preempt(g, f"白天 GPU 上限 {limit}")
+    free = [g["index"] for g in gpus if g["index"] not in mine and not others[g["index"]] and used_mem[g["index"]] < c["free_mem_mb"]]
+    waiting.sort(key=lambda m: m["id"])
+    while waiting and free and len(eff) < limit:
+        m, g = waiting.pop(0), free.pop(0)
+        sched_log(f"分配 job {m['id']} ({m.get('name')}) -> GPU {g} ({'夜间' if night else '白天'}, 我的卡 {len(eff) + 1}/{limit})" + (" [dry]" if dry else ""))
+        if not dry:
+            write_json(os.path.join(jdir(m["id"]), "assign.json"), {"gpu": g, "t": time.time()})
+        eff.add(g)
+    if verbose:
+        print(f"{'夜间' if night else '白天'} limit={limit} 我的卡={sorted(eff)} 抢占中={sorted(preempting)} 空卡={free} "
+              f"其他用户={ {g: u for g, u in others.items() if u} } 等卡={[m['id'] for m in waiting]}")
+
+
+def cmd_sched(a):
+    pidfile = os.path.join(HOME, "sched.pid")
+    old = read_json(pidfile, {}) or {}
+    alive = pid_alive(old.get("pid"), "sched")
+    if a.status:
+        print(f"调度器运行中: pid {old['pid']}, 配置 {sched_cfg()}" if alive else "调度器未运行")
+        return
+    if a.stop:
+        if alive:
+            os.kill(old["pid"], signal.SIGTERM)
+            print(f"已停止调度器 (pid {old['pid']})")
+        else:
+            print("调度器未运行")
+        return
+    if a.once:
+        return sched_tick(dry=a.dry, verbose=True)
+    if a.daemon:
+        if alive:
+            sys.exit(f"jb: 调度器已在运行 (pid {old['pid']})")
+        os.makedirs(HOME, exist_ok=True)
+        with open(os.path.join(HOME, "sched.out"), "ab") as lf:
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "sched"], stdin=subprocess.DEVNULL, stdout=lf,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+        write_json(pidfile, {"pid": p.pid})
+        time.sleep(1)
+        if p.poll() is not None:
+            sys.exit(f"jb: 调度器启动失败, 见 {os.path.join(HOME, 'sched.out')}")
+        print(f"调度器已在后台启动: pid {p.pid}, 日志 {os.path.join(HOME, 'sched.log')}")
+        return
+    if alive and old.get("pid") != os.getpid():
+        sys.exit(f"jb: 调度器已在运行 (pid {old['pid']})")
+    write_json(pidfile, {"pid": os.getpid()})
+    sched_log(f"调度器启动, 配置 {sched_cfg()}")
+    while True:
+        try:
+            sched_tick()
+        except Exception as e:  # 单轮出错 (nvidia-smi 超时等) 不退出
+            sched_log(f"本轮出错: {e!r}")
+        time.sleep(float(sched_cfg()["interval"]))
 
 
 # ---------------------------------------------------------------- commands
@@ -594,6 +827,10 @@ def gpu_env(gpus):
 
 def gpu_label(m):
     g = m.get("env", {}).get("CUDA_VISIBLE_DEVICES")
+    if m.get("sched") and (not m.get("child_pid") or g is None):
+        return "auto"
+    if m.get("sched"):
+        return f"{g}*"  # * = 调度器分配的
     return "all" if g is None else g or "cpu"
 
 
@@ -638,18 +875,21 @@ def cmd_submit(a):
     toks = a.cmd[1:] if a.cmd[0] == "--" else a.cmd
     cmd = toks[0] if len(toks) == 1 else shlex.join(toks)
     cwd = os.path.abspath(a.cwd or os.getcwd())
+    auto = str(a.gpu).lower() == "auto"
     spec = {
         "cmd": cmd, "cwd": cwd, "name": a.name, "note": a.note,
-        "env": gpu_env(parse_gpus(a.gpu, a.force)),
+        "env": {} if auto else gpu_env(parse_gpus(a.gpu, a.force)),
         "total": a.total, "pattern": a.pattern,
         "after": [int(x) for x in a.after.split(",")] if a.after else [],
         "after_any": a.after_any,
         "notify": True if a.notify else False if a.no_notify else None,
         "group": a.group,
     }
+    if auto:
+        spec.update(sched=True, preempt=not a.no_preempt)
     if a.log:
         spec["log"] = os.path.abspath(os.path.join(cwd, a.log))
-    do_submit(spec, check=not a.no_check)
+    do_submit(spec, check=not a.no_check and not auto)
 
 
 def job_row(jid):
@@ -814,7 +1054,9 @@ def cmd_kill(a):
 
 def cmd_retry(a):
     m = meta(a.id)
-    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify")}
+    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify", "sched", "preempt")}
+    if spec.get("sched"):
+        spec["env"] = {k: v for k, v in (spec["env"] or {}).items() if k != "CUDA_VISIBLE_DEVICES"}
     spec["after"], spec["after_any"] = [], False
     spec["group"] = label(a.id).get("group")
     if a.gpu is not None:
@@ -1255,7 +1497,8 @@ def main():
 
     s = sub.add_parser("submit", aliases=["sub", "run"], help="提交后台任务")
     s.add_argument("-n", "--name")
-    s.add_argument("-g", "--gpu", help="如 0 或 0,1 或 cpu; 默认继承 CUDA_VISIBLE_DEVICES 或配置的 default_gpus")
+    s.add_argument("-g", "--gpu", help="如 0 或 0,1 或 cpu 或 auto (交给 jb sched 调度); 默认继承 CUDA_VISIBLE_DEVICES 或配置的 default_gpus")
+    s.add_argument("--no-preempt", action="store_true", help="-g auto 时: 调度器不抢占这个任务")
     s.add_argument("-C", "--cwd", help="工作目录, 默认当前目录")
     s.add_argument("--total", type=float, help="总步数, 配合 --pattern 计算进度")
     s.add_argument("--pattern", help=f"提取已完成步数的正则 (第1组=done, 可选第2组=total), 默认 {DEFAULT_PATTERN}")
@@ -1324,6 +1567,14 @@ def main():
     s.add_argument("--stop", action="store_true", help="停止后台 dashboard")
     s.add_argument("--status", action="store_true")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("sched", help="GPU 调度器 (配合 submit -g auto)")
+    s.add_argument("-d", "--daemon", action="store_true", help="后台运行")
+    s.add_argument("--stop", action="store_true")
+    s.add_argument("--status", action="store_true")
+    s.add_argument("--once", action="store_true", help="只跑一轮并打印状态")
+    s.add_argument("--dry", action="store_true", help="配合 --once: 只打印决定, 不分配 / 不抢占")
+    s.set_defaults(fn=cmd_sched)
 
     s = sub.add_parser("notify", help="配置任务结束推送 (微信/QQ/手机)")
     s.add_argument("action", choices=["show", "set", "test"], nargs="?", default="show")
