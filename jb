@@ -724,7 +724,7 @@ def sched_tick(dry=False, verbose=False):
                 break
             preempt(g, f"白天 GPU 上限 {limit}")
     free = [g["index"] for g in gpus if g["index"] not in mine and not others[g["index"]] and used_mem[g["index"]] < c["free_mem_mb"]]
-    waiting.sort(key=lambda m: m["id"])
+    waiting.sort(key=lambda m: (-(m.get("prio") or 0), m["id"]))  # 优先级高的先, 同级按 ID
     while waiting and free and len(eff) < limit:
         m, g = waiting.pop(0), free.pop(0)
         sched_log(f"分配 job {m['id']} ({m.get('name')}) -> GPU {g} ({'夜间' if night else '白天'}, 我的卡 {len(eff) + 1}/{limit})" + (" [dry]" if dry else ""))
@@ -886,7 +886,7 @@ def cmd_submit(a):
         "group": a.group,
     }
     if auto:
-        spec.update(sched=True, preempt=not a.no_preempt)
+        spec.update(sched=True, preempt=not a.no_preempt, prio=a.prio)
     if a.log:
         spec["log"] = os.path.abspath(os.path.join(cwd, a.log))
     do_submit(spec, check=not a.no_check and not auto)
@@ -1054,7 +1054,7 @@ def cmd_kill(a):
 
 def cmd_retry(a):
     m = meta(a.id)
-    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify", "sched", "preempt")}
+    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify", "sched", "preempt", "prio")}
     if spec.get("sched"):
         spec["env"] = {k: v for k, v in (spec["env"] or {}).items() if k != "CUDA_VISIBLE_DEVICES"}
     spec["after"], spec["after_any"] = [], False
@@ -1499,6 +1499,7 @@ def main():
     s.add_argument("-n", "--name")
     s.add_argument("-g", "--gpu", help="如 0 或 0,1 或 cpu 或 auto (交给 jb sched 调度); 默认继承 CUDA_VISIBLE_DEVICES 或配置的 default_gpus")
     s.add_argument("--no-preempt", action="store_true", help="-g auto 时: 调度器不抢占这个任务")
+    s.add_argument("--prio", type=int, default=0, help="-g auto 时的优先级, 大的先分卡 (同级按 ID)")
     s.add_argument("-C", "--cwd", help="工作目录, 默认当前目录")
     s.add_argument("--total", type=float, help="总步数, 配合 --pattern 计算进度")
     s.add_argument("--pattern", help=f"提取已完成步数的正则 (第1组=done, 可选第2组=total), 默认 {DEFAULT_PATTERN}")

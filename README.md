@@ -50,7 +50,7 @@ jb rm --match smoke --status done,failed     # 按名称正则 / 状态 / -G 分
 
 ```bash
 jb sched -d                                  # 启动调度器守护进程 (jb sched --status / --stop; --once [--dry] 跑一轮并打印决定)
-jb submit -g auto -n run1 -- bash train.sh   # 交给调度器选卡; --no-preempt: 不允许被抢占
+jb submit -g auto -n run1 -- bash train.sh   # 交给调度器选卡; --no-preempt: 不允许被抢占; --prio N: 优先级大的先分卡 (同级按 ID)
 ```
 
 配置 `~/.jb/config.json` 的 `"sched"` (以下为默认值):
