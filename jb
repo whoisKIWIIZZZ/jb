@@ -635,7 +635,8 @@ def run_sched_job(jid, m, env, finish, killed_flag):
 
 # ---------------------------------------------------------------- scheduler
 
-SCHED_DEFAULT = {"limit": 4, "night": "01:30-08:30", "gpus": None, "interval": 20, "free_mem_mb": 2000, "kill_timeout": 900}
+SCHED_DEFAULT = {"limit": 4, "night": "01:30-08:30", "gpus": None, "interval": 20, "free_mem_mb": 2000, "kill_timeout": 900,
+                 "cooldown": 600, "share_margin_mb": 2048}
 
 
 def sched_cfg():
@@ -666,22 +667,44 @@ def sched_tick(dry=False, verbose=False):
       - 我的卡 = 有我 (任何进程, 不只是 jb) 的 GPU 进程的卡 + 已分配给调度任务的卡
       - 白天: 我的卡数 <= limit; 超出时抢占可抢占的调度任务 (先抢有其他用户的卡, 再抢最晚开始的)
       - 夜间窗口: 可以用所有没有其他用户进程的卡; 我的卡数超过 limit 时, 被其他用户用上的那张卡上的调度任务让出来
-      - 空卡 (没有我的进程、没有其他用户的进程、显存占用 < free_mem_mb) 按任务 ID 顺序分给等卡的调度任务, 一卡一个任务"""
+      - 空卡 (没有我的进程、没有其他用户的进程、显存占用 < free_mem_mb) 按任务 ID 顺序分给等卡的调度任务, 一卡一个任务
+      - 冷却: 最近 cooldown 秒内出现过其他用户进程的卡不算空卡 (对方进程时有时无时, 避免反复分配 / 抢占)
+      - --mem 的任务 (声明了显存峰值) 可以和其他用户共用一张卡: 在没有我的进程的卡里, 剩余显存 >= mem + share_margin_mb 的,
+        挑剩余显存最多的那张; 不受冷却限制, 其他用户在卡上也不让出 (本来就是共用)
+      - 每轮记下调度任务在 GPU 上的显存峰值 (job 目录 vram.json, jb show 里显示), 用来定 --mem"""
     c = sched_cfg()
     me = getpass.getuser()
     allowed = c["gpus"] or load_cfg().get("allowed_gpus")
-    gpus = query_gpus({})
-    if allowed:
-        keep = set(str(allowed).split(","))
-        gpus = [g for g in gpus if g["index"] in keep]
-    others = {g["index"]: sorted({q["user"] for q in g["procs"] if q["user"] not in (me, "?")}) for g in gpus}
-    mine = {g["index"] for g in gpus if any(q["user"] == me for q in g["procs"])}
-    used_mem = {g["index"]: g["mem_used"] or 0 for g in gpus}
     jobs = []
     for jid in all_ids():
         m = read_json(os.path.join(jdir(jid), "meta.json"))
         if m and m.get("sched") and status(m) in ACTIVE:
             jobs.append(m)
+    gpus = query_gpus({m["child_pid"]: m["id"] for m in jobs if m.get("child_pid")})
+    use = {}
+    for g in gpus:
+        for q in g["procs"]:
+            if q.get("job") is not None and q.get("mem"):
+                use[q["job"]] = use.get(q["job"], 0) + q["mem"]
+    for jid, mb in use.items():
+        vf = os.path.join(jdir(jid), "vram.json")
+        v = read_json(vf, {}) or {}
+        if mb > (v.get("peak_mb") or 0) and not dry:
+            write_json(vf, {"peak_mb": mb, "t": time.time()})
+    if allowed:
+        keep = set(str(allowed).split(","))
+        gpus = [g for g in gpus if g["index"] in keep]
+    others = {g["index"]: sorted({q["user"] for q in g["procs"] if q["user"] not in (me, "?")}) for g in gpus}
+    mine = {g["index"] for g in gpus if any(q["user"] == me for q in g["procs"])}
+    now = time.time()
+    seen_f = os.path.join(HOME, "sched_seen.json")  # 每张卡最后一次看到其他用户进程的时间, 存盘: 调度器重启 / --once 也认
+    seen = read_json(seen_f, {}) or {}
+    if any(others.values()):
+        seen.update({g: now for g, u in others.items() if u})
+        write_json(seen_f, seen)
+    cooling = {g: int(seen[g] + float(c["cooldown"]) - now) for g in others if seen.get(g) and now - seen[g] < float(c["cooldown"])}
+    used_mem = {g["index"]: g["mem_used"] or 0 for g in gpus}
+    free_vram = {g["index"]: (g["mem_total"] or 0) - (g["mem_used"] or 0) for g in gpus}
     assigned, preempting, waiting = {}, set(), []
     for m in jobs:
         d = jdir(m["id"])
@@ -715,7 +738,7 @@ def sched_tick(dry=False, verbose=False):
         for g in sorted(cand, key=lambda g: -assigned[g].get("run_start", 0)):
             if len(eff) <= int(c["limit"]):
                 break
-            if others.get(g):
+            if others.get(g) and not assigned[g].get("mem_mb"):
                 preempt(g, f"其他用户 {','.join(others[g])} 开始用这张卡")
     # 白天超出 limit -> 抢占, 先抢有其他用户的卡, 再抢最晚开始的
     if not night and len(eff) > limit:
@@ -723,17 +746,37 @@ def sched_tick(dry=False, verbose=False):
             if len(eff) <= limit:
                 break
             preempt(g, f"白天 GPU 上限 {limit}")
-    free = [g["index"] for g in gpus if g["index"] not in mine and not others[g["index"]] and used_mem[g["index"]] < c["free_mem_mb"]]
+    free = [g["index"] for g in gpus if g["index"] not in mine and not others[g["index"]] and g["index"] not in cooling
+            and used_mem[g["index"]] < c["free_mem_mb"]]
     waiting.sort(key=lambda m: (-(m.get("prio") or 0), m["id"]))  # 优先级高的先, 同级按 ID
-    while waiting and free and len(eff) < limit:
-        m, g = waiting.pop(0), free.pop(0)
-        sched_log(f"分配 job {m['id']} ({m.get('name')}) -> GPU {g} ({'夜间' if night else '白天'}, 我的卡 {len(eff) + 1}/{limit})" + (" [dry]" if dry else ""))
+    left = []
+    for m in waiting:
+        if len(eff) >= limit:
+            left.append(m)
+            continue
+        need = m.get("mem_mb")
+        if need:  # 可共用: 没有我的进程的卡里, 剩余显存够 (含余量) 的, 挑剩余最多的
+            ok = [g["index"] for g in gpus if g["index"] not in eff and g["index"] not in preempting
+                  and free_vram[g["index"]] >= need + int(c["share_margin_mb"])]
+            g = max(ok, key=lambda i: free_vram[i]) if ok else None
+        else:
+            g = next((i for i in free if i not in eff), None)
+        if g is None:
+            left.append(m)
+            continue
+        if g in free:
+            free.remove(g)
+        how = f"共用, 剩余显存 {free_vram[g] / 1024:.1f}G, 需要 {need / 1024:.1f}G" if need else "独占"
+        sched_log(f"分配 job {m['id']} ({m.get('name')}) -> GPU {g} ({'夜间' if night else '白天'}, {how}, 我的卡 {len(eff) + 1}/{limit})" + (" [dry]" if dry else ""))
         if not dry:
             write_json(os.path.join(jdir(m["id"]), "assign.json"), {"gpu": g, "t": time.time()})
         eff.add(g)
+    waiting = left
     if verbose:
         print(f"{'夜间' if night else '白天'} limit={limit} 我的卡={sorted(eff)} 抢占中={sorted(preempting)} 空卡={free} "
-              f"其他用户={ {g: u for g, u in others.items() if u} } 等卡={[m['id'] for m in waiting]}")
+              f"冷却中(剩余秒)={ {g: t for g, t in cooling.items() if not others.get(g)} } "
+              f"其他用户={ {g: u for g, u in others.items() if u} } 剩余显存G={ {g: round(v / 1024, 1) for g, v in free_vram.items()} } "
+              f"等卡={[m['id'] for m in waiting]}")
 
 
 def cmd_sched(a):
@@ -887,6 +930,8 @@ def cmd_submit(a):
     }
     if auto:
         spec.update(sched=True, preempt=not a.no_preempt, prio=a.prio)
+        if a.mem:
+            spec["mem_mb"] = int(a.mem * 1024)
     if a.log:
         spec["log"] = os.path.abspath(os.path.join(cwd, a.log))
     do_submit(spec, check=not a.no_check and not auto)
@@ -966,6 +1011,9 @@ def cmd_show(a):
         rate_s = "-" if not rate else (f"{rate:.3g}/s" if rate >= 1 else f"{rate * 60:.3g}/min")
         print(f"  progress : {prog_str(p)}  (via {p.get('source')})  rate {rate_s}  "
               f"ETA {fmt_dur(eta_now(m, st, p))}  updated {fmt_dur(time.time() - p['updated'])} ago")
+    v = read_json(os.path.join(jdir(m["id"]), "vram.json"))
+    if v or m.get("mem_mb"):
+        print(f"  vram     : peak {(v or {}).get('peak_mb', 0) / 1024:.1f}G" + (f"  (declared --mem {m['mem_mb'] / 1024:.1f}G)" if m.get("mem_mb") else ""))
     print(f"  log      : {m['log']}")
     print("  ---- tail ----")
     for line in tail_lines(m["log"], a.n):
@@ -1054,7 +1102,7 @@ def cmd_kill(a):
 
 def cmd_retry(a):
     m = meta(a.id)
-    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify", "sched", "preempt", "prio")}
+    spec = {k: m.get(k) for k in ("cmd", "cwd", "name", "note", "env", "total", "pattern", "notify", "sched", "preempt", "prio", "mem_mb")}
     if spec.get("sched"):
         spec["env"] = {k: v for k, v in (spec["env"] or {}).items() if k != "CUDA_VISIBLE_DEVICES"}
     spec["after"], spec["after_any"] = [], False
@@ -1500,6 +1548,8 @@ def main():
     s.add_argument("-g", "--gpu", help="如 0 或 0,1 或 cpu 或 auto (交给 jb sched 调度); 默认继承 CUDA_VISIBLE_DEVICES 或配置的 default_gpus")
     s.add_argument("--no-preempt", action="store_true", help="-g auto 时: 调度器不抢占这个任务")
     s.add_argument("--prio", type=int, default=0, help="-g auto 时的优先级, 大的先分卡 (同级按 ID)")
+    s.add_argument("--mem", type=float, default=0,
+                   help="-g auto 时: 显存峰值 (GB). 给了就可以和其他用户共用卡, 放到剩余显存最多且 >= mem + 余量的卡上")
     s.add_argument("-C", "--cwd", help="工作目录, 默认当前目录")
     s.add_argument("--total", type=float, help="总步数, 配合 --pattern 计算进度")
     s.add_argument("--pattern", help=f"提取已完成步数的正则 (第1组=done, 可选第2组=total), 默认 {DEFAULT_PATTERN}")

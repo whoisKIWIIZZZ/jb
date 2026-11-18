@@ -50,16 +50,19 @@ jb rm --match smoke --status done,failed     # 按名称正则 / 状态 / -G 分
 
 ```bash
 jb sched -d                                  # 启动调度器守护进程 (jb sched --status / --stop; --once [--dry] 跑一轮并打印决定)
-jb submit -g auto -n run1 -- bash train.sh   # 交给调度器选卡; --no-preempt: 不允许被抢占; --prio N: 优先级大的先分卡 (同级按 ID)
+jb submit -g auto -n run1 -- bash train.sh   # 交给调度器选卡; --no-preempt: 不允许被抢占
+jb submit -g auto --mem 10 -n ev -- bash eval.sh   # 显存峰值 10G: 可和其他用户共用卡, 放到剩余显存最多的卡上; --prio N: 优先级大的先分卡 (同级按 ID)
 ```
 
 配置 `~/.jb/config.json` 的 `"sched"` (以下为默认值):
 
 ```json
-{"sched": {"limit": 4, "night": "01:30-08:30", "gpus": null, "interval": 20, "free_mem_mb": 2000, "kill_timeout": 900}}
+{"sched": {"limit": 4, "night": "01:30-08:30", "gpus": null, "interval": 20, "free_mem_mb": 2000, "kill_timeout": 900, "cooldown": 600}}
 ```
 
 - **我的卡** = 有我 (任何进程, 不只是 jb) 的 GPU 进程的卡 + 已分配给调度任务的卡. **空卡** = 没有我的进程、没有其他用户的进程、显存占用 < `free_mem_mb`.
+- **冷却**: 最近 `cooldown` 秒内出现过其他用户进程的卡也不算空卡 (每张卡最后看到的时间存在 `~/.jb/sched_seen.json`), 免得对方进程时有时无时反复分配 / 抢占.
+- **共用 (`--mem GB`)**: 声明显存峰值的任务可以放到有其他用户的卡上: 没有我的进程、剩余显存 >= mem + `share_margin_mb` (默认 2048) 的卡里挑剩余最多的; 不受冷却限制, 夜间其他用户上卡也不让出. 调度器每轮记下任务的显存峰值 (job 目录 `vram.json`, `jb show` 里的 `vram` 行), 用来定 `--mem`.
 - 白天: 我的卡不超过 `limit` 张, 空卡按任务 ID 顺序分给等卡的 `-g auto` 任务, 一卡一个.
 - 夜间窗口 `night` (本机时区, 可跨零点): 所有空卡都可借用; 我的卡超过 `limit` 时, 被其他用户用上的那张卡上的调度任务让出来.
 - 夜间窗口结束: 超过 `limit` 的部分抢占掉 (先抢有其他用户的卡, 再抢最晚开始的).
